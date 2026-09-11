@@ -90,7 +90,13 @@ def versions_for_sample(sample_id: str) -> dict:
 @app.get("/api/v1/judgments/{package_id}/diff/{other_package_id}",
          tags=["judgments"])
 def diff_packages(package_id: str, other_package_id: str) -> dict:
-    """比较两个判定包（任意版本），返回逐时钟字段变化与违规增减。"""
+    """比较两个判定包（任意版本），返回逐时钟字段变化与违规增减。
+
+    若任一侧为样品级补录包，则比较视图限定在该样品（包内其它样品不参与），
+    从而 A 的补录不会在 B 的比较基线中产生变化。
+    """
+    import copy
+
     a = db.get_package(package_id)
     b = db.get_package(other_package_id)
     if not a or not b:
@@ -99,12 +105,28 @@ def diff_packages(package_id: str, other_package_id: str) -> dict:
             f"判定包缺失: "
             f"{package_id if not a else other_package_id}",
         )
-    changes = diff_judgments(a, b)
+
+    scopes = {x.get("sample_id") for x in (a, b) if x.get("sample_id")}
+    scope_sample = next(iter(scopes)) if len(scopes) == 1 else None
+
+    def scoped(pkg: dict) -> dict:
+        if scope_sample is None:
+            return pkg
+        p = copy.deepcopy(pkg)
+        p["clocks"] = [c for c in p.get("clocks", [])
+                       if c["sample_id"] == scope_sample]
+        p["violations"] = [v for v in p.get("violations", [])
+                           if v["sample_id"] == scope_sample]
+        return p
+
+    a_s, b_s = scoped(a), scoped(b)
+    changes = diff_judgments(a_s, b_s)
     return {
         "from": {"package_id": package_id, "version_no": a["version_no"],
-                 "rule": a["rule"]},
+                 "sample_id": a.get("sample_id"), "rule": a["rule"]},
         "to": {"package_id": other_package_id, "version_no": b["version_no"],
-               "rule": b["rule"]},
+               "sample_id": b.get("sample_id"), "rule": b["rule"]},
+        "scope_sample": scope_sample,
         "rule_changed": a["rule"]["content_hash"] != b["rule"]["content_hash"],
         "change_count": len(changes),
         "changes": changes,

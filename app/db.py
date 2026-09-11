@@ -175,9 +175,12 @@ def list_rule_sets() -> list[dict]:
 # ---------------------------------------------------------------- 判定 ----
 
 def _register_sample_versions(conn, package: JudgmentResult) -> None:
-    sample_ids = {c.sample_id for c in package.clocks}
     if package.sample_id:
-        sample_ids.add(package.sample_id)
+        # 样品级补录：只登记目标样品，版本视图不波及同批其它样品
+        sample_ids = {package.sample_id}
+    else:
+        # 批次接收：包内每个样品共享同一批次版本
+        sample_ids = {c.sample_id for c in package.clocks}
     for sid in sample_ids:
         conn.execute(
             "INSERT OR IGNORE INTO sample_versions(sample_id, scope_key, version_no,"
@@ -245,21 +248,26 @@ def get_package_model(package_id: str) -> Optional[JudgmentResult]:
 
 def list_sample_versions(sample_id: str) -> list[dict]:
     rows = get_conn().execute(
-        "SELECT j.package_id, j.version_no, j.scope, j.eval_time, j.created_at,"
-        " j.rule_hash FROM sample_versions sv JOIN judgments j"
-        " ON j.package_id = sv.package_id WHERE sv.sample_id = ?"
+        "SELECT j.package_id, j.version_no, j.scope, j.sample_id AS pkg_sample_id,"
+        " j.eval_time, j.created_at, j.rule_hash FROM sample_versions sv"
+        " JOIN judgments j ON j.package_id = sv.package_id"
+        " WHERE sv.sample_id = ? AND (j.sample_id IS NULL OR j.sample_id = ?)"
         " ORDER BY j.version_no DESC, j.created_at DESC",
-        (sample_id,),
+        (sample_id, sample_id),
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def latest_sample_package(sample_id: str) -> Optional[dict]:
+    # 优先返回样品级补录版本；无样品级版本时回退到批次版本。
+    # 样品级包（sample_id=其它样品）对本样品不可见，避免补录串样品。
     row = get_conn().execute(
         "SELECT j.package_json FROM sample_versions sv JOIN judgments j"
         " ON j.package_id = sv.package_id WHERE sv.sample_id = ?"
-        " ORDER BY j.version_no DESC, j.created_at DESC LIMIT 1",
-        (sample_id,),
+        " AND (j.sample_id IS NULL OR j.sample_id = ?)"
+        " ORDER BY (j.scope = 'sample') DESC, j.version_no DESC,"
+        " j.created_at DESC LIMIT 1",
+        (sample_id, sample_id),
     ).fetchone()
     return json.loads(row["package_json"]) if row else None
 

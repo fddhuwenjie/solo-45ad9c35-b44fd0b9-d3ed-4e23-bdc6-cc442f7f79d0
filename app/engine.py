@@ -376,6 +376,50 @@ class _Engine:
                 raw_viol.append(("time_inversion", sid, [item], rec["message"],
                                  rec["detail"]))
 
+        # 判定时刻之后才“发生”的事件属于未来记录：记 time_inversion，
+        # 列出受影响项目与完整推导；这些事件不得据此结束任何阶段，也不参与交接判定。
+        ignored_future: list[str] = []
+
+        def future_violation(kind: str, label: str, when: datetime,
+                             phase_hint: str = "") -> None:
+            ignored_future.append(f"{label}@{iso(when)}")
+            raw_viol.append((
+                "time_inversion", sid, [item],
+                f"样品 {sid} 项目 {item} 的{label}时刻 {iso(when)} 晚于判定时刻 "
+                f"{iso(req.eval_time)}（事件尚未发生{phase_hint}）",
+                {"event_type": kind, "event_time": iso(when),
+                 "eval_time": iso(req.eval_time)},
+            ))
+
+        for a in hist["preservation"]:
+            if a.time > req.eval_time:
+                future_violation("preservation", f"防腐动作 {a.name}", a.time)
+        for e in hist["pretreatments"]:
+            if e.time > req.eval_time and (not e.items or item in e.items):
+                future_violation("pretreatment", f"前处理事件 {e.type}", e.time,
+                                 "，不得据此结束预处理阶段")
+        for e in hist["analyses"]:
+            if e.item == item and e.time > req.eval_time:
+                future_violation("analysis", f"分析事件({item})", e.time,
+                                 "，不得据此结束分析阶段")
+        for p in hist["temperature"]:
+            if p.time > req.eval_time:
+                future_violation("temperature",
+                                 f"温度记录 {p.temp_c}℃", p.time)
+        eligible_transfers = [t for t in hist["transfers"] if t <= req.eval_time]
+        for t in hist["transfers"]:
+            if t > req.eval_time:
+                future_violation("custody_transfer", "交接", t,
+                                 "，不计入已完成交接")
+        if ignored_future:
+            deriv.append(DerivationStep(
+                step="ignore_future_events",
+                detail=(
+                    f"{len(ignored_future)} 条记录晚于判定时刻 {iso(req.eval_time)}，"
+                    f"已识别为 time_inversion 且不结束任何阶段：{ignored_future}"
+                ),
+            ))
+
         deadline_pre = deadline_ana = None
         pre_done = ana_done = None
 
@@ -394,17 +438,21 @@ class _Engine:
                 ),
             ))
 
+            # 仅判定时刻之前（含）的事件才能结束对应阶段
             scoped_pre = [
                 e for e in hist["pretreatments"]
-                if not e.items or item in e.items
+                if e.time <= req.eval_time and (not e.items or item in e.items)
             ]
             if scoped_pre:
                 pre_done = scoped_pre[-1].time
-            ana_events = [e for e in hist["analyses"] if e.item == item]
+            ana_events = [
+                e for e in hist["analyses"]
+                if e.item == item and e.time <= req.eval_time
+            ]
             if ana_events:
                 ana_done = ana_events[-1].time
 
-            # 防腐动作
+            # 防腐动作（同样只计已发生的）
             have = {a.name for a in hist["preservation"] if a.time <= req.eval_time}
             missing = [p for p in rule.required_preservation if p not in have]
             if missing:
@@ -414,9 +462,9 @@ class _Engine:
                     {"required": rule.required_preservation, "performed": sorted(have)},
                 ))
 
-            # 交接晚于截止时刻
-            if hist["transfers"]:
-                latest_xfer = hist["transfers"][-1]
+            # 交接晚于截止时刻（未来交接不参与）
+            if eligible_transfers:
+                latest_xfer = eligible_transfers[-1]
                 late_against = None
                 if deadline_ana is not None and latest_xfer > deadline_ana:
                     late_against = ("analysis", deadline_ana)

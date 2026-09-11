@@ -203,6 +203,62 @@ def test_late_pretreatment_completion_flags_overdue(client):
     assert phases["pretreatment"]["status"] == "overdue"  # 125 > 120
 
 
+def test_future_analysis_event_not_marked_completed(client):
+    """eval=30、分析事件在 500（未来）：不得据此结束分析阶段，且报 time_inversion。"""
+    from app.models import AnalysisEvent
+    s = make_sample(analyses=[AnalysisEvent(item="oil", time=dt(500))],
+                    temperature=temps(0, 30, 10))
+    r = client.post("/api/v1/judgments/trial",
+                    json=request([s], eval_min=30).model_dump(mode="json"))
+    body = r.json()
+    clocks = {c["item"]: c for c in body["clocks"]}
+    oil = clocks["oil"]
+    assert oil["status"] != "completed"
+    ana_phase = {p["phase"]: p for p in oil["phases"]}["analysis"]
+    assert ana_phase["status"] in ("pending", "critical")
+    assert ana_phase["done_at"] is None
+    # cod 时钟不受该未来分析事件影响
+    assert clocks["cod"]["status"] == "ok"
+
+    inv = [v for v in body["violations"] if v["code"] == "time_inversion"]
+    assert inv, "应返回 time_inversion 违规"
+    hit = [v for v in inv if "oil" in v["items"]]
+    assert hit and all(v["sample_id"] == "b1" for v in hit)
+    detail = hit[0]["detail"]
+    occ = detail["occurrences"] if "occurrences" in detail else [detail]
+    assert any(o.get("event_type") == "analysis" for o in occ)
+    # 受影响时钟推导链必须说明该未来事件被忽略
+    assert any(st["step"] == "ignore_future_events" for st in oil["derivation"])
+    assert not oil["conforming"]
+
+
+def test_future_pretreatment_event_does_not_end_phase(client):
+    """未来的前处理事件不能把预处理阶段标为 completed。"""
+    from app.models import PretreatmentEvent
+    # cod 预处理期限 120；事件在 100（期限内）但 eval=30，属于未来事件
+    s = make_sample(pretreatments=[PretreatmentEvent(type="digestion", time=dt(100))],
+                    temperature=temps(0, 30, 10))
+    r = client.post("/api/v1/judgments/trial",
+                    json=request([s], eval_min=30).model_dump(mode="json"))
+    cod = {c["item"]: c for c in r.json()["clocks"]}["cod"]
+    pre = {p["phase"]: p for p in cod["phases"]}["pretreatment"]
+    assert pre["status"] != "completed"
+    assert pre["done_at"] is None
+    assert any(v["code"] == "time_inversion" and "cod" in v["items"]
+               for v in r.json()["violations"])
+
+
+def test_future_transfer_ignored_and_flagged(client):
+    """未来交接既不算已交接，也不据此判 late_transfer，只报 time_inversion。"""
+    s = make_sample(custody_transfers=[dt(15), dt(700)],
+                    temperature=temps(0, 30, 10))
+    r = client.post("/api/v1/judgments/trial",
+                    json=request([s], eval_min=30).model_dump(mode="json"))
+    codes = {v["code"] for v in r.json()["violations"]}
+    assert "time_inversion" in codes
+    assert "late_transfer" not in codes  # 未来交接不参与晚交接判定
+
+
 # ============================================================== 分样/合样 ----
 
 def test_aliquot_shares_basis_and_history(client):
@@ -439,6 +495,79 @@ def test_supplement_unknown_sample_404(client):
     r = client.post("/api/v1/samples/NOPE/supplement",
                     json={"eval_time": dt(10).isoformat()})
     assert r.status_code == 404
+
+
+def test_supplement_version_isolated_per_sample(client):
+    """A、B 同批生成 v1；仅补录 A：B 的版本列表/latest/比较基线都不得出现 A 的 v2。"""
+    a = make_sample(id="SA")
+    b = make_sample(id="SB")
+    payload = request([a, b], eval_min=30, idempotency_key="batch-AB")
+    r1 = client.post("/api/v1/judgments", json=payload.model_dump(mode="json"))
+    assert r1.status_code == 201, r1.text
+    batch_pkg = r1.json()["package_id"]
+
+    # 补录只针对 A：oil 在 500 分钟完成分析，温度补齐，eval=510
+    supp = {
+        "eval_time": dt(510).isoformat(),
+        "analyses": [{"item": "oil", "time": dt(500).isoformat()}],
+        "temperature": [{"time": dt(m).isoformat(), "temp_c": 3.0}
+                        for m in range(40, 511, 10)],
+    }
+    r2 = client.post("/api/v1/samples/SA/supplement", json=supp)
+    assert r2.status_code == 201, r2.text
+    a_v2 = r2.json()
+    assert a_v2["sample_id"] == "SA"
+    assert a_v2["version_no"] == 2
+    assert a_v2["changes_from"] == batch_pkg
+    # changes 只涉及 A，不波及 B
+    assert all(ch["sample_id"] == "SA" for ch in a_v2["changes"])
+
+    # A 的版本视图：v2（样品级）+ v1（批次级）
+    va = client.get("/api/v1/samples/SA/versions").json()["versions"]
+    assert [v["version_no"] for v in va] == [2, 1]
+    assert va[0]["package_id"] == a_v2["package_id"]
+
+    # B 的版本视图：只有 v1 批次包，绝不出现 A 的 v2
+    vb = client.get("/api/v1/samples/SB/versions").json()["versions"]
+    assert [v["version_no"] for v in vb] == [1]
+    assert vb[0]["package_id"] == batch_pkg
+    assert a_v2["package_id"] not in [v["package_id"] for v in vb]
+
+    # B 的 latest 必须仍是批次包，且包内 sample_id 为空（不能返回 sample_id=SA）
+    latest_b = client.get("/api/v1/samples/SB/latest").json()
+    assert latest_b["package_id"] == batch_pkg
+    assert latest_b["sample_id"] is None
+    # A 的 latest 是其样品级 v2
+    latest_a = client.get("/api/v1/samples/SA/latest").json()
+    assert latest_a["package_id"] == a_v2["package_id"]
+    assert latest_a["sample_id"] == "SA"
+
+    # 比较基线：A 的 v2 基于批次包；用 B 视角 diff 批次包与 A 的 v2
+    # 时，样品级包对 B 不可见 —— 直接对两包做版本比较端点（跨包）仍可用，
+    # 但 B 的 latest 永不指向它。
+    d = client.get(
+        f"/api/v1/judgments/{batch_pkg}/diff/{a_v2['package_id']}"
+    ).json()
+    changed_samples = {c["sample_id"] for c in d["changes"]}
+    assert "SB" not in changed_samples
+    assert "SA" in changed_samples
+
+
+def test_b_supplement_does_not_touch_a(client):
+    """反向：只补录 B，A 的视图保持不变。"""
+    a = make_sample(id="PA")
+    b = make_sample(id="PB")
+    payload = request([a, b], eval_min=30, idempotency_key="batch-P")
+    batch_pkg = client.post("/api/v1/judgments",
+                            json=payload.model_dump(mode="json")).json()["package_id"]
+    supp = {"eval_time": dt(40).isoformat(),
+            "temperature": [{"time": dt(40).isoformat(), "temp_c": 3.0}]}
+    rb = client.post("/api/v1/samples/PB/supplement", json=supp)
+    assert rb.status_code == 201
+    # A 仍是批次 v1
+    va = client.get("/api/v1/samples/PA/versions").json()["versions"]
+    assert [v["version_no"] for v in va] == [1]
+    assert client.get("/api/v1/samples/PA/latest").json()["package_id"] == batch_pkg
 
 
 # ============================================================== 校验 ----

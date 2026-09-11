@@ -180,6 +180,8 @@ def supplement_judgment(
     raw_changes = diff_judgments(
         latest_pkg, preview.model_dump(mode="json")
     )
+    # 样品级补录：只呈现该样品自身时钟与违规的变化，同批其它样品不在视图内
+    raw_changes = [c for c in raw_changes if c.get("sample_id") == sample_id]
     changes = _to_status_changes(raw_changes, sample_id)
 
     # 正式持久化：生成正式 package_id（非 trial- 前缀），时间戳沿用 preview
