@@ -1,0 +1,42 @@
+{
+  "request_id": "REQ-NORMAL-001",
+  "idempotency_key": "demo-normal-001",
+  "eval_time": "2026-09-11T08:30:00+08:00",
+  "critical_within_minutes": 60,
+  "rule_set": {
+    "version": "HJ-2026.1",
+    "items": [
+      {"item": "cod", "min_temp_c": 0, "max_temp_c": 4,
+       "pretreatment_minutes": 120, "analysis_minutes": 1440,
+       "required_preservation": ["cool_4c"]},
+      {"item": "oil", "min_temp_c": 0, "max_temp_c": 4,
+       "pretreatment_minutes": null, "analysis_minutes": 600,
+       "required_preservation": ["cool_4c", "dark"]},
+      {"item": "nh3n", "min_temp_c": 0, "max_temp_c": 4,
+       "pretreatment_minutes": 240, "analysis_minutes": 1440,
+       "required_preservation": ["add_acid"]}
+    ]
+  },
+  "samples": [
+    {
+      "id": "B-001",
+      "kind": "grab",
+      "items": ["cod", "oil", "nh3n"],
+      "container": "glass_amber",
+      "sampling_start": "2026-09-11T08:00:00+08:00",
+      "sampling_end": "2026-09-11T08:00:00+08:00",
+      "preservation": [
+        {"name": "cool_4c", "time": "2026-09-11T08:02:00+08:00"},
+        {"name": "dark", "time": "2026-09-11T08:02:00+08:00"},
+        {"name": "add_acid", "time": "2026-09-11T08:03:00+08:00"}
+      ],
+      "temperature": [
+        {"time": "2026-09-11T08:00:00+08:00", "temp_c": 3.1},
+        {"time": "2026-09-11T08:10:00+08:00", "temp_c": 3.0},
+        {"time": "2026-09-11T08:20:00+08:00", "temp_c": 2.9},
+        {"time": "2026-09-11T08:30:00+08:00", "temp_c": 3.0}
+      ],
+      "custody_transfers": ["2026-09-11T08:20:00+08:00"]
+    }
+  ]
+}

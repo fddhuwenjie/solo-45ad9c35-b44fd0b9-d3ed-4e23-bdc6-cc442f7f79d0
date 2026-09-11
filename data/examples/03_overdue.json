@@ -1,0 +1,41 @@
+{
+  "request_id": "REQ-OVERDUE-001",
+  "eval_time": "2026-09-11T20:00:00+08:00",
+  "critical_within_minutes": 60,
+  "rule_set": {
+    "version": "HJ-2026.1",
+    "items": [
+      {"item": "cod", "min_temp_c": 0, "max_temp_c": 4,
+       "pretreatment_minutes": 120, "analysis_minutes": 1440,
+       "required_preservation": ["cool_4c"]},
+      {"item": "oil", "min_temp_c": 0, "max_temp_c": 4,
+       "pretreatment_minutes": null, "analysis_minutes": 600,
+       "required_preservation": ["cool_4c", "dark"]}
+    ]
+  },
+  "samples": [
+    {
+      "id": "O-001",
+      "kind": "grab",
+      "items": ["cod", "oil"],
+      "container": "glass_amber",
+      "sampling_start": "2026-09-11T08:00:00+08:00",
+      "sampling_end": "2026-09-11T08:00:00+08:00",
+      "preservation": [
+        {"name": "cool_4c", "time": "2026-09-11T08:02:00+08:00"},
+        {"name": "dark", "time": "2026-09-11T08:02:00+08:00"}
+      ],
+      "temperature": [
+        {"time": "2026-09-11T08:00:00+08:00", "temp_c": 3.1},
+        {"time": "2026-09-11T12:00:00+08:00", "temp_c": 3.0},
+        {"time": "2026-09-11T14:00:00+08:00", "temp_c": 6.5},
+        {"time": "2026-09-11T16:00:00+08:00", "temp_c": 7.2},
+        {"time": "2026-09-11T18:00:00+08:00", "temp_c": 3.0}
+      ],
+      "custody_transfers": [
+        "2026-09-11T08:20:00+08:00",
+        "2026-09-11T19:00:00+08:00"
+      ]
+    }
+  ]
+}
