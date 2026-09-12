@@ -83,6 +83,13 @@ class Occupation:
     capacity: Optional[int] = None
     switch_before_minutes: float = 0.0
 
+    def copy(self) -> "Occupation":
+        return Occupation(
+            self.batch_id, self.resource_id, self.method, self.start,
+            self.end, self.frozen, list(self.task_keys),
+            self.kind, self.capacity, self.switch_before_minutes,
+        )
+
 
 # ------------------------------------------------------------- 时段 ----
 
@@ -140,6 +147,13 @@ class _ResourceState:
 
     def sorted_occs(self) -> list[Occupation]:
         return sorted(self.occs, key=lambda o: (o.start, o.batch_id))
+
+    def copy(self) -> "_ResourceState":
+        ns = _ResourceState.__new__(_ResourceState)
+        ns.cfg = self.cfg
+        ns.free = list(self.free)
+        ns.occs = [o.copy() for o in self.occs]
+        return ns
 
 
 # --------------------------------------------------------- 插入位置 ----
@@ -224,6 +238,92 @@ def _find_new_slot(
                             dur, tsw, ready, deadline)
             if cand is not None and (
                 best is None or (cand[2], cand[1]) < (best[2], best[1])
+            ):
+                best = cand
+    return best
+
+
+def _try_gap_latest(
+    g0: datetime,
+    g1: datetime,
+    prev_occ: Optional[Occupation],
+    next_occ: Optional[Occupation],
+    method: Optional[str],
+    dur: timedelta,
+    tsw: timedelta,
+    ready: datetime,
+    deadline: Optional[datetime],
+) -> Optional[tuple[datetime, datetime, int]]:
+    """在空隙 [g0, g1) 内尽量**最晚**放入一个批次（开始最晚、结束不晚于
+    截止）。返回 (start, end, 净切换数) 或 None。用于波束搜索的延迟分支：
+    把批次后移可为后续同方法任务腾出前置空隙。"""
+    earliest = g0 if g0 > ready else ready
+    if prev_occ is not None and prev_occ.method != method:
+        t = prev_occ.end + tsw
+        if t > earliest:
+            earliest = t
+    end_limit = g1
+    if next_occ is not None and next_occ.method != method:
+        t = next_occ.start - tsw
+        if t < end_limit:
+            end_limit = t
+    if deadline is not None and deadline < end_limit:
+        end_limit = deadline
+    start = end_limit - dur
+    if start < earliest:
+        return None
+    end = start + dur
+    added = (1 if prev_occ is not None and prev_occ.method != method else 0) + (
+        1 if next_occ is not None and next_occ.method != method else 0
+    )
+    removed = 1 if (
+        prev_occ is not None
+        and next_occ is not None
+        and prev_occ.method != next_occ.method
+    ) else 0
+    return (start, end, added - removed)
+
+
+def _find_new_slot_latest(
+    state: _ResourceState,
+    method: Optional[str],
+    ready: datetime,
+    deadline: Optional[datetime],
+) -> Optional[tuple[datetime, datetime, int]]:
+    """该资源上“净切换最少、开始最晚”的整批插入位置；无可行位置返回 None。"""
+    cfg = state.cfg
+    dur = timedelta(minutes=cfg.task_minutes)
+    tsw = timedelta(minutes=cfg.switch_minutes)
+    occs = state.sorted_occs()
+    best: Optional[tuple[datetime, datetime, int]] = None
+    for fs, fe in state.free:
+        cursor = fs if fs > ready else ready
+        prev: Optional[Occupation] = None
+        for occ in occs:
+            if occ.end <= cursor:
+                prev = occ
+                continue
+            if occ.start >= fe:
+                break
+            cand = _try_gap_latest(cursor, occ.start, prev, occ, method,
+                                   dur, tsw, ready, deadline)
+            if cand is not None and (
+                best is None
+                or cand[2] < best[2]
+                or (cand[2] == best[2] and cand[0] > best[0])
+            ):
+                best = cand
+            cursor = occ.end if occ.end > cursor else cursor
+            prev = occ
+            if cursor >= fe:
+                break
+        if cursor < fe:
+            cand = _try_gap_latest(cursor, fe, prev, None, method,
+                                   dur, tsw, ready, deadline)
+            if cand is not None and (
+                best is None
+                or cand[2] < best[2]
+                or (cand[2] == best[2] and cand[0] > best[0])
             ):
                 best = cand
     return best
@@ -532,6 +632,224 @@ def _total_switches(states: dict[str, _ResourceState]) -> int:
     return total
 
 
+# --------------------------------------------------------- 波束搜索 ----
+
+_BEAM_WIDTH = 8            # 每层保留的分支数
+_MAX_BEAM_EXPANSIONS = 4000  # 展开总数安全上限（超出退回当前最优）
+
+
+def _build_states(
+    resources: list[ResourceConfig],
+    frozen_batches: list[Occupation],
+    schedule_time: datetime,
+) -> dict[str, _ResourceState]:
+    states = {cfg.resource_id: _ResourceState(cfg, schedule_time)
+              for cfg in resources}
+    for occ in frozen_batches:
+        st = states.get(occ.resource_id)
+        if st is not None:
+            st.occs.append(occ)
+    return states
+
+
+def _copy_states(
+    states: dict[str, _ResourceState],
+) -> dict[str, _ResourceState]:
+    return {rid: st.copy() for rid, st in states.items()}
+
+
+def _kinds(
+    states: dict[str, _ResourceState],
+) -> tuple[list[_ResourceState], list[_ResourceState]]:
+    stations = sorted(
+        (s for s in states.values() if s.cfg.kind == ResourceKind.PRETREATMENT),
+        key=lambda s: s.rid,
+    )
+    instruments = sorted(
+        (s for s in states.values() if s.cfg.kind == ResourceKind.INSTRUMENT),
+        key=lambda s: s.rid,
+    )
+    return stations, instruments
+
+
+def _slot_options(
+    states_list: list[_ResourceState],
+    task: SchedTask,
+    ready: datetime,
+    deadline: Optional[datetime],
+) -> list[tuple]:
+    """该任务的有界候选排入：最佳并入 + 全局最早/最晚新批槽位（均去重）。
+
+    返回 (kind, resource_id, batch_id|None, start, end, 净切换数)。
+    “最晚槽位”是延迟放置的规范化表示：为后续同方法任务腾出前置空隙。
+    """
+    options: list[tuple] = []
+    joins: list[tuple] = []
+    earliest: list[tuple] = []
+    latest: list[tuple] = []
+    for st in states_list:
+        if not st.compatible(task.method):
+            continue
+        for occ in st.occs:
+            if occ.frozen or occ.method != task.method:
+                continue
+            if len(occ.task_keys) >= st.cfg.capacity:
+                continue
+            if occ.start < ready:
+                continue
+            if deadline is not None and occ.end > deadline:
+                continue
+            joins.append((occ.end, st.rid, occ.batch_id, occ.start))
+        est = _find_new_slot(st, task.method, ready, deadline)
+        if est is not None:
+            earliest.append(
+                ((est[2], est[1], st.rid),
+                 ("new", st.rid, None, est[0], est[1], est[2]))
+            )
+        lst = _find_new_slot_latest(st, task.method, ready, deadline)
+        if lst is not None:
+            latest.append(
+                ((lst[2], -lst[1].timestamp(), st.rid),
+                 ("new", st.rid, None, lst[0], lst[1], lst[2]))
+            )
+    if joins:
+        end, rid, bid, start = min(joins)
+        options.append(("join", rid, bid, start, end, 0))
+    if earliest:
+        options.append(min(earliest)[1])
+    if latest:
+        opt = min(latest)[1]
+        if all(o[1] != opt[1] or o[3] != opt[3] or o[4] != opt[4]
+               for o in options):
+            options.append(opt)
+    options.sort(key=lambda o: (o[5], o[4], o[1], o[2] or ""))
+    return options
+
+
+def _apply_option(
+    states: dict[str, _ResourceState],
+    task: SchedTask,
+    option: tuple,
+) -> Occupation:
+    kind, rid, bid, start, end, _net = option
+    st = states[rid]
+    if kind == "join":
+        occ = next(o for o in st.occs if o.batch_id == bid)
+    else:
+        existing = {o.batch_id for o in st.occs}
+        seq = len(st.occs) + 1
+        nbid = f"{rid}#b{seq:03d}"
+        while nbid in existing:
+            seq += 1
+            nbid = f"{rid}#b{seq:03d}"
+        occ = Occupation(nbid, rid, task.method, start, end, False, [])
+        st.occs.append(occ)
+    occ.task_keys.append(task.key)
+    return occ
+
+
+def _expand_clock(
+    states: dict[str, _ResourceState],
+    placed: list[tuple[SchedTask, Occupation]],
+    sid: str,
+    item: str,
+    phases: dict[str, SchedTask],
+    frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]],
+    schedule_time: datetime,
+) -> list[tuple]:
+    """展开一个时钟的分支：完整放置（各候选槽位组合）或整体跳过。"""
+    pre = phases.get(PRETREATMENT)
+    ana = phases.get(ANALYSIS)
+    stations, instruments = _kinds(states)
+    out: list[tuple] = []
+    if pre is not None:
+        for po in _slot_options(stations, pre, schedule_time, pre.deadline):
+            st1 = _copy_states(states)
+            occ1 = _apply_option(st1, pre, po)
+            if ana is None:
+                out.append((st1, placed + [(pre, occ1)]))
+                continue
+            _, inst1 = _kinds(st1)
+            for ao in _slot_options(inst1, ana, occ1.end, ana.deadline):
+                st2 = _copy_states(st1)
+                occ2 = _apply_option(st2, ana, ao)
+                out.append((st2, placed + [(pre, occ1), (ana, occ2)]))
+    else:
+        ready = schedule_time
+        fz = frozen_intervals.get((sid, item, PRETREATMENT))
+        if fz is not None and fz[1] > ready:
+            ready = fz[1]
+        for ao in _slot_options(instruments, ana, ready, ana.deadline):
+            st1 = _copy_states(states)
+            occ = _apply_option(st1, ana, ao)
+            out.append((st1, placed + [(ana, occ)]))
+    # 整体跳过该时钟（输入状态在展开中不被修改，可直接复用）
+    out.append((states, placed))
+    return out
+
+
+def _beam_signature(placed: list[tuple[SchedTask, Occupation]]) -> tuple:
+    """调度结果的确定性签名（用于去重与同分 tie-break）。"""
+    return tuple(
+        (t.key, occ.resource_id, occ.start, occ.end)
+        for t, occ in sorted(placed, key=lambda x: x[0].key)
+    )
+
+
+def _beam_rank(
+    states: dict[str, _ResourceState],
+    placed: list[tuple[SchedTask, Occupation]],
+    all_tasks: list[SchedTask],
+) -> tuple:
+    """升序排序键：准时时钟数降 -> 切换数升 -> 规范签名升（开始早、资源小）。"""
+    return (
+        -_on_time_clocks(placed, all_tasks),
+        _total_switches(states),
+        _beam_signature(placed),
+    )
+
+
+def _beam_search(
+    *,
+    tasks: list[SchedTask],
+    resources: list[ResourceConfig],
+    frozen_batches: list[Occupation],
+    frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]],
+    schedule_time: datetime,
+) -> tuple[dict[str, _ResourceState], list[tuple[SchedTask, Occupation]]]:
+    """波束搜索：按时钟 EDF 逐层展开，每层保留度量最优的前 W 个分支。
+
+    候选槽位含“最早/最晚”两种新批位置，因此能把阻塞同方法连续批次的
+    任务推迟到仍准时的位置；跳过选项对应舍弃该时钟。返回最优分支。
+    """
+    beam: list[tuple] = [(_build_states(resources, frozen_batches,
+                                        schedule_time), [])]
+    expansions = 0
+    for (sid, item), phases in _clock_order(tasks):
+        expanded: list[tuple] = []
+        for states, placed in beam:
+            expanded.extend(
+                _expand_clock(states, placed, sid, item, phases,
+                              frozen_intervals, schedule_time)
+            )
+        expansions += len(expanded)
+        expanded.sort(key=lambda sp: _beam_rank(sp[0], sp[1], tasks))
+        deduped: list[tuple] = []
+        seen: set[tuple] = set()
+        for sp in expanded:
+            sig = _beam_signature(sp[1])
+            if sig in seen:
+                continue
+            seen.add(sig)
+            deduped.append(sp)
+            if len(deduped) >= _BEAM_WIDTH:
+                break
+        beam = deduped
+        if expansions > _MAX_BEAM_EXPANSIONS:
+            break  # 安全上限：保留当前层最优分支
+    return beam[0]
+
+
 # ------------------------------------------------------------- 主流程 ----
 
 def compute_schedule(
@@ -612,6 +930,22 @@ def compute_schedule(
                 best_metric = _m
                 best_states, best_placed = cur_states, cur_placed
         states, placed = best_states, best_placed
+        best_metric = metric(states, placed)
+
+    if best_metric[0] < len(all_clocks):
+        # 波束搜索：每层保留多个分支（含“最晚槽位”延迟放置），覆盖舍弃
+        # 修复无法触及的调度（如把阻塞同方法连续批次的任务推迟到仍准时
+        # 的位置）。仅当字典序严格更优时才采用，保证快速路径行为不变。
+        bs_states, bs_placed = _beam_search(
+            tasks=tasks,
+            resources=resources,
+            frozen_batches=active_frozen,
+            frozen_intervals=frozen_intervals,
+            schedule_time=schedule_time,
+        )
+        bs_metric = metric(bs_states, bs_placed)
+        if bs_metric > best_metric:
+            states, placed, best_metric = bs_states, bs_placed, bs_metric
 
     stations = sorted(
         (s for s in states.values() if s.cfg.kind == ResourceKind.PRETREATMENT),
