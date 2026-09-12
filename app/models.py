@@ -35,17 +35,64 @@ class ContinuousBasis(str, Enum):
     END = "end"
 
 
+class TimeRange(BaseModel):
+    """不确定时刻：现场手写/断电补录只能把真实时刻圈在 [earliest, latest] 内。
+
+    两端均含；earliest == latest 时退化为精确时刻。判定引擎沿来源链对区间做
+    传播：基准、截止与剩余分钟都成为区间，整区间未超时才判 compliant，
+    整区间越界才判 overdue，跨过期限为 indeterminate。
+    """
+    earliest: datetime = Field(..., description="可能最早时刻（含），带时区")
+    latest: datetime = Field(..., description="可能最晚时刻（含），带时区")
+
+    @field_validator("earliest", "latest")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return as_utc(v)
+
+    @model_validator(mode="after")
+    def _order(self) -> "TimeRange":
+        if self.latest < self.earliest:
+            raise ValueError("时间区间非法：latest 不得早于 earliest")
+        return self
+
+    @property
+    def exact(self) -> bool:
+        return self.earliest == self.latest
+
+    def midpoint(self) -> datetime:
+        """标量代表值（仅用于展示/排序；判定语义一律用完整区间）。"""
+        return self.earliest + (self.latest - self.earliest) / 2
+
+
+# 任何可提交时刻的字段：精确 ISO 时刻或 {earliest, latest} 区间
+TimeSpec = datetime | TimeRange
+
+
+def as_range(v: TimeSpec) -> TimeRange:
+    """把精确时刻归一化为退化区间；区间原样返回。"""
+    return v if isinstance(v, TimeRange) else TimeRange(earliest=v, latest=v)
+
+
+def _tz_spec(v):
+    if v is None or isinstance(v, TimeRange):
+        return v
+    return as_utc(v)
+
+
 # ---------------------------------------------------------------- 请求侧 ----
 
 class PreservationAction(BaseModel):
     name: str = Field(..., description="动作名，如 add_acid / cool_4c / dark")
-    time: datetime
+    time: TimeSpec = Field(
+        ..., description="精确时刻（ISO-8601）或 {earliest, latest} 区间"
+    )
     note: Optional[str] = None
 
     @field_validator("time")
     @classmethod
-    def _tz(cls, v: datetime) -> datetime:
-        return as_utc(v)
+    def _tz(cls, v: TimeSpec) -> TimeSpec:
+        return _tz_spec(v)
 
 
 class TemperaturePoint(BaseModel):
@@ -64,7 +111,9 @@ class TemperaturePoint(BaseModel):
 class PretreatmentEvent(BaseModel):
     """前处理（消解/萃取/蒸馏等）；只结束“预处理”阶段，不影响分析期限。"""
     type: str = Field(..., description="如 digestion / extraction / distillation")
-    time: datetime
+    time: TimeSpec = Field(
+        ..., description="精确时刻（ISO-8601）或 {earliest, latest} 区间"
+    )
     items: list[str] = Field(
         default_factory=list,
         description="作用到的项目；空列表表示对该样品全部项目生效",
@@ -72,19 +121,21 @@ class PretreatmentEvent(BaseModel):
 
     @field_validator("time")
     @classmethod
-    def _tz(cls, v: datetime) -> datetime:
-        return as_utc(v)
+    def _tz(cls, v: TimeSpec) -> TimeSpec:
+        return _tz_spec(v)
 
 
 class AnalysisEvent(BaseModel):
     item: str
-    time: datetime
+    time: TimeSpec = Field(
+        ..., description="精确时刻（ISO-8601）或 {earliest, latest} 区间"
+    )
     note: Optional[str] = None
 
     @field_validator("time")
     @classmethod
-    def _tz(cls, v: datetime) -> datetime:
-        return as_utc(v)
+    def _tz(cls, v: TimeSpec) -> TimeSpec:
+        return _tz_spec(v)
 
 
 class ItemRule(BaseModel):
@@ -194,38 +245,42 @@ class Sample(BaseModel):
         default_factory=dict,
         description="按项目提交的分析方法，键为项目，值如 hj828 / hj535；可只覆盖部分项目",
     )
-    sampling_start: datetime
-    sampling_end: datetime
+    sampling_start: TimeSpec = Field(
+        ..., description="采样开始：精确时刻或 {earliest, latest} 区间"
+    )
+    sampling_end: TimeSpec = Field(
+        ..., description="采样结束：精确时刻或 {earliest, latest} 区间"
+    )
     parent_ids: list[str] = Field(
         default_factory=list,
         description="来源：分样为母体；合样为全部组成样；瞬时/连续样为空",
     )
-    merged_at: Optional[datetime] = Field(
-        None, description="合样时刻（仅 composite）：此前历史共享，此后独立"
+    merged_at: Optional[TimeSpec] = Field(
+        None, description="合样时刻（仅 composite）：此前历史共享，此后独立；"
+        "可提交 {earliest, latest} 区间"
     )
     preservation: list[PreservationAction] = Field(default_factory=list)
     temperature: list[TemperaturePoint] = Field(default_factory=list)
     pretreatments: list[PretreatmentEvent] = Field(default_factory=list)
     analyses: list[AnalysisEvent] = Field(default_factory=list)
-    custody_transfers: list[datetime] = Field(
-        default_factory=list, description="交接时间序列"
+    custody_transfers: list[TimeSpec] = Field(
+        default_factory=list, description="交接时间序列（精确时刻或区间）"
     )
 
     @field_validator("sampling_start", "sampling_end", "merged_at")
     @classmethod
-    def _tz(cls, v: Optional[datetime]) -> Optional[datetime]:
-        return as_utc(v) if v is not None else None
+    def _tz(cls, v: Optional[TimeSpec]) -> Optional[TimeSpec]:
+        return _tz_spec(v)
 
     @field_validator("custody_transfers")
     @classmethod
-    def _tz_list(cls, v: list[datetime]) -> list[datetime]:
-        return [as_utc(x) for x in v]
+    def _tz_list(cls, v: list[TimeSpec]) -> list[TimeSpec]:
+        return [_tz_spec(x) for x in v]
 
     @model_validator(mode="after")
     def _shape(self) -> "Sample":
-        if self.sampling_end < self.sampling_start:
-            # 时间倒置留给引擎出“完整推导”，不在 422 阶段拦截
-            pass
+        # 采样起止倒置/区间交叠留给引擎出“完整推导”（time_inversion 或
+        # time_uncertainty_conflict），不在 422 阶段拦截
         if self.kind == SampleKind.COMPOSITE and not self.parent_ids:
             raise ValueError("合样必须提供 parent_ids")
         if self.kind == SampleKind.ALIQUOT and not self.parent_ids:
@@ -315,6 +370,31 @@ class JudgmentRequest(BaseModel):
         return self
 
 
+class TimeCorrections(BaseModel):
+    """补录时整体替换的时间修正：把先前只能圈定范围的时刻收窄（或改为精确值）。
+
+    提供的字段整体替换该样品原有记录；未提供的字段保持不变。
+    修正与追加事件可同一次提交：先应用修正，再追加新事件。
+    """
+    sampling_start: Optional[TimeSpec] = None
+    sampling_end: Optional[TimeSpec] = None
+    merged_at: Optional[TimeSpec] = None
+    preservation: Optional[list[PreservationAction]] = None
+    pretreatments: Optional[list[PretreatmentEvent]] = None
+    analyses: Optional[list[AnalysisEvent]] = None
+    custody_transfers: Optional[list[TimeSpec]] = None
+
+    @field_validator("sampling_start", "sampling_end", "merged_at")
+    @classmethod
+    def _tz(cls, v: Optional[TimeSpec]) -> Optional[TimeSpec]:
+        return _tz_spec(v)
+
+    @field_validator("custody_transfers")
+    @classmethod
+    def _tz_list(cls, v: Optional[list[TimeSpec]]) -> Optional[list[TimeSpec]]:
+        return None if v is None else [_tz_spec(x) for x in v]
+
+
 class SupplementEvent(BaseModel):
     """补录事件（挂在指定样品上），生成新判定版本。"""
     eval_time: datetime
@@ -323,7 +403,10 @@ class SupplementEvent(BaseModel):
     temperature: list[TemperaturePoint] = Field(default_factory=list)
     pretreatments: list[PretreatmentEvent] = Field(default_factory=list)
     analyses: list[AnalysisEvent] = Field(default_factory=list)
-    custody_transfers: list[datetime] = Field(default_factory=list)
+    custody_transfers: list[TimeSpec] = Field(default_factory=list)
+    corrections: Optional[TimeCorrections] = Field(
+        None, description="时间修正：整体替换对应字段，用于把区间收窄为精确时刻"
+    )
     note: Optional[str] = None
 
     @field_validator("eval_time")
@@ -333,8 +416,8 @@ class SupplementEvent(BaseModel):
 
     @field_validator("custody_transfers")
     @classmethod
-    def _tz_list(cls, v: list[datetime]) -> list[datetime]:
-        return [as_utc(x) for x in v]
+    def _tz_list(cls, v: list[TimeSpec]) -> list[TimeSpec]:
+        return [_tz_spec(x) for x in v]
 
 
 # ---------------------------------------------------------------- 响应侧 ----
@@ -344,6 +427,7 @@ class PhaseStatus(str, Enum):
     COMPLETED = "completed"
     CRITICAL = "critical"
     OVERDUE = "overdue"
+    INDETERMINATE = "indeterminate"  # 时间区间跨过期限/完成时刻无法确定
     INVALID = "invalid"
 
 
@@ -388,6 +472,9 @@ class UnmetCondition(BaseModel):
     ]
     required: list
     actual: Optional[str] = None
+    uncertain: bool = Field(
+        False, description="该维度因时间区间跨过边界而无法确定（非确定未满足）"
+    )
     field_sources: list[FieldSource] = Field(
         default_factory=list,
         description="参与该维度判定的实际字段及来源样品（含沿来源链回退的取值）",
@@ -408,7 +495,16 @@ class CandidateRuleView(BaseModel):
     rule_id: str
     item: str
     item_name: Optional[str] = None
-    applies: bool = Field(..., description="是否满足全部适用条件")
+    applies: bool = Field(
+        ..., description="是否在整个基准区间内都满足全部适用条件（确定适用）"
+    )
+    possible: bool = Field(
+        True, description="是否在基准区间内存在满足全部适用条件的时刻（可能适用）"
+    )
+    time_match: Literal["in", "out", "straddle"] = Field(
+        "in", description="基准区间相对规则生效区间的位置：in=全在内 / "
+        "out=全在外 / straddle=跨过边界（适用性无法确定）"
+    )
     unmet: list[UnmetCondition] = Field(default_factory=list)
     effective_from: Optional[datetime] = None
     effective_to: Optional[datetime] = None
@@ -424,6 +520,64 @@ class MatchContext(BaseModel):
     """规则筛选使用的实际条件；field_sources 逐字段说明取值来源。"""
     basis_time: datetime
     field_sources: list[FieldSource] = Field(default_factory=list)
+
+
+# ------------------------------------------------- 时间不确定性（响应） ----
+
+class IntervalView(BaseModel):
+    """一个时间区间（earliest == latest 时 exact=true，即精确时刻）。"""
+    earliest: datetime
+    latest: datetime
+    exact: bool
+
+
+class MinutesInterval(BaseModel):
+    """剩余分钟区间：earliest 为最早截止对应的最坏情形。"""
+    earliest: int
+    latest: int
+
+
+class PhaseUncertainty(BaseModel):
+    phase: Literal["pretreatment", "analysis"]
+    deadline: Optional[IntervalView] = None
+    done_at: Optional[IntervalView] = None
+    remaining_minutes: Optional[MinutesInterval] = None
+    assessment: Optional[Literal["compliant", "overdue", "indeterminate"]] = Field(
+        None, description="该阶段期限结论：整区间未超时=compliant；整区间越界"
+        "=overdue；跨过期限=indeterminate；无期限/失效时为 null"
+    )
+
+
+class UncertaintySource(BaseModel):
+    """一个以区间形式提交的时间输入（精确输入不列出）。"""
+    sample_id: str = Field(..., description="区间记录实际来自的样品（沿来源链）")
+    field: str = Field(
+        ..., description="sampling_start / sampling_end / merged_at / "
+        "preservation / pretreatment / analysis / custody_transfer"
+    )
+    earliest: datetime
+    latest: datetime
+    label: Optional[str] = Field(
+        None, description="事件标识（防腐动作名 / 前处理类型 / 分析项目）"
+    )
+
+
+class ClockUncertainty(BaseModel):
+    """时钟的时间不确定性传播结果；仅当来源链上存在区间输入时出现。"""
+    basis_time: Optional[IntervalView] = Field(
+        None, description="沿来源链推导的基准时刻区间（基准不可解析时为 null）"
+    )
+    phases: list[PhaseUncertainty] = Field(default_factory=list)
+    remaining_minutes: Optional[MinutesInterval] = Field(
+        None, description="下一待办阶段的剩余分钟区间"
+    )
+    assessment: Literal["compliant", "overdue", "indeterminate"] = Field(
+        ..., description="时钟级期限结论：整区间未超时=compliant；整区间越界"
+        "=overdue；跨过期限或存在冲突=indeterminate"
+    )
+    sources: list[UncertaintySource] = Field(
+        default_factory=list, description="参与推导的全部区间输入及其来源样品"
+    )
 
 
 class ClockResult(BaseModel):
@@ -460,12 +614,17 @@ class ClockResult(BaseModel):
     match_context: Optional[MatchContext] = Field(
         None, description="本次筛选使用的实际条件与各字段来源"
     )
+    uncertainty: Optional[ClockUncertainty] = Field(
+        None, description="时间不确定性传播结果（基准/截止/剩余区间与冲突）；"
+        "来源链上存在区间输入时给出，全部为精确时刻时为 null"
+    )
     derivation: list[DerivationStep]
 
 
 class Violation(BaseModel):
     code: Literal[
         "time_inversion",
+        "time_uncertainty_conflict",
         "source_cycle",
         "source_break",
         "temperature_excursion",

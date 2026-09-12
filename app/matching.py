@@ -39,6 +39,27 @@ def in_interval(
     return True
 
 
+def interval_position(
+    earliest: datetime,
+    latest: datetime,
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> str:
+    """时刻区间 [earliest, latest] 相对半开区间 [start, end) 的位置。
+
+    * ``in``：整个时刻区间都在生效区间内（确定适用）；
+    * ``out``：整个时刻区间都在生效区间外（确定不适用）；
+    * ``straddle``：跨过边界（适用性无法确定）。
+    """
+    if (start is None or earliest >= start) and (end is None or latest < end):
+        return "in"
+    if (end is not None and earliest >= end) or (
+        start is not None and latest < start
+    ):
+        return "out"
+    return "straddle"
+
+
 def intervals_overlap(
     a0: Optional[datetime], a1: Optional[datetime],
     b0: Optional[datetime], b1: Optional[datetime],
@@ -64,11 +85,37 @@ def dimension_overlap(a: Optional[list[str]], b: Optional[list[str]]) -> bool:
 def evaluate_applicability(rule: Any, ctx: dict) -> list[dict]:
     """返回规则在给定实际条件下未满足的维度列表；空列表表示完全匹配。
 
-    ``ctx`` 键：basis_time / matrix / method / container / storage_condition。
-    每项为 ``{"dimension", "required", "actual"}``，来源描述由引擎补。
+    ``ctx`` 键：basis_time / basis_range / matrix / method / container /
+    storage_condition。每项为 ``{"dimension", "required", "actual"}``，
+    来源描述由引擎补。
+
+    基准为区间时传 ``basis_range=(earliest, latest)``：整区间落在生效区间外
+    才算确定未满足；跨过边界记 ``uncertain=True`` 的未满足项（适用性本身
+    无法确定，由引擎按 possible/applies 两级处理）。
     """
     unmet: list[dict] = []
-    if not in_interval(ctx.get("basis_time"), rule.effective_from, rule.effective_to):
+    if "basis_range" in ctx:
+        earliest, latest = ctx["basis_range"]
+        pos = interval_position(
+            earliest, latest, rule.effective_from, rule.effective_to
+        )
+        if pos == "out":
+            unmet.append({
+                "dimension": "effective_time",
+                "required": [rule.effective_from, rule.effective_to],
+                "actual": None,
+                "actual_range": (earliest, latest),
+                "uncertain": False,
+            })
+        elif pos == "straddle":
+            unmet.append({
+                "dimension": "effective_time",
+                "required": [rule.effective_from, rule.effective_to],
+                "actual": None,
+                "actual_range": (earliest, latest),
+                "uncertain": True,
+            })
+    elif not in_interval(ctx.get("basis_time"), rule.effective_from, rule.effective_to):
         unmet.append({
             "dimension": "effective_time",
             "required": [rule.effective_from, rule.effective_to],

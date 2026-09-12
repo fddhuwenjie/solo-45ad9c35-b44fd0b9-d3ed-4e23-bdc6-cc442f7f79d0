@@ -218,6 +218,26 @@ def _append_events(target: Sample, ev: SupplementEvent) -> None:
     )
 
 
+def _apply_corrections(target: Sample, ev: SupplementEvent) -> list[str]:
+    """应用时间修正：整体替换对应字段（把区间收窄为精确时刻）。
+
+    返回被修正的字段名列表（进入推导与响应便于审计）。
+    """
+    c = ev.corrections
+    if c is None:
+        return []
+    applied: list[str] = []
+    for field in (
+        "sampling_start", "sampling_end", "merged_at",
+        "preservation", "pretreatments", "analyses", "custody_transfers",
+    ):
+        val = getattr(c, field)
+        if val is not None:
+            setattr(target, field, val)
+            applied.append(field)
+    return applied
+
+
 def _to_status_changes(raw_changes: list[dict], sample_id: str) -> list[StatusChange]:
     out: list[StatusChange] = []
     for c in raw_changes:
@@ -276,6 +296,7 @@ def supplement_judgment(
         raise HTTPException(
             404, f"样品 {sample_id} 不在判定包 {latest_pkg['package_id']} 中"
         )
+    corrected = _apply_corrections(target, ev)
     _append_events(target, ev)
     request.eval_time = ev.eval_time
     if ev.critical_within_minutes is not None:

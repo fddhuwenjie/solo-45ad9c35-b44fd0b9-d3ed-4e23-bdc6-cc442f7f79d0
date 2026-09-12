@@ -530,6 +530,37 @@ def _clock_order(tasks: list[SchedTask]) -> list[tuple]:
     )
 
 
+def _method_grouped_order(tasks: list[SchedTask]) -> list[tuple]:
+    """方法分组排序：组间按组内最早截止（并列按方法名），组内 EDF。
+
+    同方法时钟连续处理，批次自然成段，是减少方法切换的候选排程。
+    """
+    by_clock: dict[tuple[str, str], dict[str, SchedTask]] = {}
+    for t in tasks:
+        by_clock.setdefault((t.sample_id, t.item), {})[t.phase] = t
+
+    def clock_method(phases: dict[str, SchedTask]) -> Optional[str]:
+        return next(iter(phases.values())).method
+
+    groups: dict[Optional[str], list[tuple]] = {}
+    for ck, phases in by_clock.items():
+        groups.setdefault(clock_method(phases), []).append((ck, phases))
+
+    def group_key(members: list[tuple]) -> tuple:
+        earliest = min(t.deadline for _, ph in members for t in ph.values())
+        method = clock_method(members[0][1])
+        return (earliest, method or "")
+
+    ordered: list[tuple] = []
+    for method in sorted(groups, key=lambda m: group_key(groups[m])):
+        members = groups[method]
+        members.sort(key=lambda ck_ph: (
+            min(t.deadline for t in ck_ph[1].values()),
+            ck_ph[0][0], ck_ph[0][1]))
+        ordered.extend(members)
+    return ordered
+
+
 def _greedy_place(
     *,
     tasks: list[SchedTask],
@@ -537,8 +568,9 @@ def _greedy_place(
     frozen_batches: list[Occupation],
     frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]],
     schedule_time: datetime,
+    clock_order: Optional[list[tuple]] = None,
 ) -> tuple[dict[str, _ResourceState], list[tuple[SchedTask, Occupation]]]:
-    """一次确定性 EDF 贪心排程。返回 (资源状态, 已排任务及占用)。"""
+    """一次确定性贪心排程（默认 EDF 时钟序）。返回 (资源状态, 已排任务及占用)。"""
     states = {cfg.resource_id: _ResourceState(cfg, schedule_time)
               for cfg in resources}
     for occ in frozen_batches:
@@ -579,7 +611,7 @@ def _greedy_place(
         return occ
 
     placed: list[tuple[SchedTask, Occupation]] = []
-    for (sid, item), phases in _clock_order(tasks):
+    for (sid, item), phases in (clock_order or _clock_order(tasks)):
         pre = phases.get(PRETREATMENT)
         ana = phases.get(ANALYSIS)
         pre_end: Optional[datetime] = None

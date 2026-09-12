@@ -125,6 +125,34 @@ def _clock_view(c: dict) -> tuple:
     )
 
 
+def _fmt_interval(iv: Optional[dict]) -> Optional[str]:
+    if iv is None:
+        return None
+    if iv.get("exact"):
+        return str(iv["earliest"])
+    return f"[{iv['earliest']}, {iv['latest']}]"
+
+
+def _uncertainty_fields(u: Optional[dict]) -> dict[str, Optional[str]]:
+    """把时钟的 uncertainty 块摊平成可比较的字段（区间收窄/结论变化）。"""
+    if not u:
+        return {}
+    out: dict[str, Optional[str]] = {
+        "basis_interval": _fmt_interval(u.get("basis_time")),
+        "uncertainty_assessment": u.get("assessment"),
+    }
+    rem = u.get("remaining_minutes")
+    out["remaining_minutes_interval"] = (
+        None if rem is None else f"[{rem['earliest']}, {rem['latest']}]"
+    )
+    for p in u.get("phases", []):
+        ph = p.get("phase")
+        out[f"phase.{ph}.deadline_interval"] = _fmt_interval(p.get("deadline"))
+        out[f"phase.{ph}.done_interval"] = _fmt_interval(p.get("done_at"))
+        out[f"phase.{ph}.assessment"] = p.get("assessment")
+    return out
+
+
 def diff_judgments(old_pkg: dict, new_pkg: dict) -> list[dict]:
     """比较两个判定包（dict），给出每个样品—项目时钟的状态变化。"""
     old_map = {
@@ -186,6 +214,36 @@ def diff_judgments(old_pkg: dict, new_pkg: dict) -> list[dict]:
                     "after": None if nm is None else f"{nm['version']}#{nm['rule_id']}",
                 }
             )
+
+        # 时间不确定性：区间出现/消失（补录精确时刻）与区间收窄过程
+        ou = oc.get("uncertainty")
+        nu = nc.get("uncertainty")
+        if bool(ou) != bool(nu):
+            changes.append(
+                {
+                    "sample_id": sid,
+                    "item": item,
+                    "kind": "field_changed",
+                    "field": "uncertainty",
+                    "before": "ranged" if ou else "exact",
+                    "after": "ranged" if nu else "exact",
+                }
+            )
+        ofields = _uncertainty_fields(ou)
+        nfields = _uncertainty_fields(nu)
+        for field in sorted(set(ofields) | set(nfields)):
+            ov, nv = ofields.get(field), nfields.get(field)
+            if ov != nv:
+                changes.append(
+                    {
+                        "sample_id": sid,
+                        "item": item,
+                        "kind": "field_changed",
+                        "field": field,
+                        "before": None if ov is None else str(ov),
+                        "after": None if nv is None else str(nv),
+                    }
+                )
 
     def vkey(v: dict) -> tuple:
         return (v["code"], v["sample_id"], tuple(sorted(v["items"])), v["message"])
