@@ -5,7 +5,9 @@
 * 待排任务：从已冻结判定包的时钟提取的待办阶段（前处理/分析，含截止时刻）；
 * 资源配置：前处理工位与仪器（可用时段、停机窗、单批容量、单批任务时长、
   方法切换时间、适用方法）；
-* 已签发占用：上一签发版本冻结的批次（不可改排，只占住资源时段）。
+* 已签发占用：上一签发版本冻结的批次（不可改排，只占住资源时段；资源已被
+  新版本配置移除的批次作为孤立冻结记录保留，不再约束新排但仍出现在批次
+  视图、后续计划与 JSON 工作单中）。
 
 约束：
 
@@ -22,11 +24,16 @@
 
 目标（字典序）：
 
-1. 先让更多项目准时完成——只接受不晚于截止时刻的排入；无法准时的任务不
-   纳入计划，转入 ``conflicts``，指出最早冲突的资源、区间与受影响时钟；
-2. 再减少方法切换——同等可行时优先并入既有同方法批次（零切换），新建批次
-   取“净切换数最少、结束最早、资源 id 最小”的位置；
+1. 先让更多项目准时完成——准时时钟数最大：先做一次确定性 EDF 贪心
+   （同等可行时优先并入同方法批次、新建批次取净切换最少且结束最早的
+   位置），若仍有无法准时的时钟，再做“舍弃单个时钟重排”的爬山修复，
+   只要（准时时钟数, 一切换数）字典序更优就接受——例如切换时间很长的
+   反例中，会舍弃一个独占批次的项目，让两个同方法项目合批准时完成；
+2. 再减少方法切换——爬山比较的第二关键字即全计划切换数；
 3. 相同输入得到稳定结果——所有迭代与 tie-break 确定，无随机性。
+
+无法准时纳入计划的任务转入 ``conflicts``，指出最早冲突的资源、区间与
+受影响时钟（兼容资源窗口短于任务时，给出该资源上最早的空闲区间）。
 """
 from __future__ import annotations
 
@@ -38,6 +45,8 @@ from .models import ResourceConfig, ResourceKind
 
 PRETREATMENT = "pretreatment"
 ANALYSIS = "analysis"
+
+_MAX_REPAIRS = 500  # 爬山修复的安全上限（每次接受都是严格改进，正常远早于此）
 
 
 @dataclass
@@ -57,7 +66,11 @@ class SchedTask:
 
 @dataclass
 class Occupation:
-    """资源上的一个批次占用（新排或已签发冻结）。"""
+    """资源上的一个批次占用（新排或已签发冻结）。
+
+    kind/capacity/switch_before_minutes 只在资源已从当前配置移除（孤立冻结
+    批次）时用于还原批次视图；正常冻结批次的这些属性以资源当前配置为准。
+    """
     batch_id: str
     resource_id: str
     method: Optional[str]
@@ -65,6 +78,9 @@ class Occupation:
     end: datetime
     frozen: bool
     task_keys: list[str] = field(default_factory=list)
+    kind: Optional[str] = None
+    capacity: Optional[int] = None
+    switch_before_minutes: float = 0.0
 
 
 # ------------------------------------------------------------- 时段 ----
@@ -282,6 +298,46 @@ def _earliest_slot(
     return best
 
 
+def _earliest_gap(
+    states: list[_ResourceState],
+    task: SchedTask,
+    ready: datetime,
+) -> Optional[tuple[datetime, str, datetime]]:
+    """各兼容资源上 ready 之后最早的空闲空隙（可能短于任务时长）。
+
+    用于“窗口短于任务”的冲突报告：指出最早冲突的资源与区间。
+    返回 (gap_start, resource_id, gap_end)。
+    """
+    best = None
+    for st in states:
+        occs = st.sorted_occs()
+        first: Optional[tuple[datetime, datetime]] = None
+        for fs, fe in st.free:
+            cursor = fs if fs > ready else ready
+            gap: Optional[tuple[datetime, datetime]] = None
+            for occ in occs:
+                if occ.end <= cursor:
+                    continue
+                if occ.start >= fe:
+                    break
+                if occ.start > cursor:
+                    gap = (cursor, occ.start)
+                    break
+                # 占用覆盖 cursor：推进到其结束之后继续找
+                cursor = occ.end
+            if gap is None and cursor < fe:
+                gap = (cursor, fe)
+            if gap is not None:
+                first = gap
+                break
+        if first is None:
+            continue
+        cand = (first[0], st.rid, first[1])
+        if best is None or (cand[0], cand[1]) < (best[0], best[1]):
+            best = cand
+    return best
+
+
 # ------------------------------------------------------------- 冲突 ----
 
 def _affected(task: SchedTask) -> dict:
@@ -310,12 +366,31 @@ def _make_conflict(
             f"（方法 {task.method or '未提交'}），无法纳入计划"
         )
     elif slot is None:
+        # 窗口/空隙短于任务时长：仍指出最早冲突的资源与空闲区间
         reason = "window_unavailable"
-        resource_id, interval, minutes_late = None, None, None
-        msg = (
-            f"{task.sample_id}/{task.item}/{task.phase} 的任务时长放不进任何"
-            "可用时段减去停机窗后的空闲区间，无法纳入计划"
-        )
+        minutes_late = None
+        gap = _earliest_gap(compatible, task, ready)
+        if gap is not None:
+            g_start, resource_id, g_end = gap
+            interval = {"start": g_start, "end": g_end}
+            dur = next(
+                (st.cfg.task_minutes for st in compatible
+                 if st.rid == resource_id),
+                None,
+            )
+            gap_min = int(round((g_end - g_start).total_seconds() / 60.0))
+            msg = (
+                f"{task.sample_id}/{task.item}/{task.phase} 的任务时长 "
+                f"{dur:g} 分钟放不进 {resource_id} 的最早空闲区间 "
+                f"[{g_start.isoformat()}, {g_end.isoformat()})"
+                f"（{gap_min} 分钟），无法纳入计划"
+            )
+        else:
+            resource_id, interval = None, None
+            msg = (
+                f"{task.sample_id}/{task.item}/{task.phase} 在排程基准之后"
+                "没有任何可用空闲区间，无法纳入计划"
+            )
     else:
         end, resource_id, _bid, start = slot
         reason = "deadline_miss"
@@ -340,34 +415,35 @@ def _make_conflict(
     }
 
 
-# ------------------------------------------------------------- 主流程 ----
+# --------------------------------------------------------- 贪心与修复 ----
 
-def compute_schedule(
+def _clock_order(tasks: list[SchedTask]) -> list[tuple]:
+    """按时钟分组并排序：EDF（时钟最早截止）+ 确定性 tie-break。"""
+    by_clock: dict[tuple[str, str], dict[str, SchedTask]] = {}
+    for t in tasks:
+        by_clock.setdefault((t.sample_id, t.item), {})[t.phase] = t
+    return sorted(
+        by_clock.items(),
+        key=lambda kv: (min(x.deadline for x in kv[1].values()),
+                        kv[0][0], kv[0][1]),
+    )
+
+
+def _greedy_place(
     *,
     tasks: list[SchedTask],
     resources: list[ResourceConfig],
     frozen_batches: list[Occupation],
-    frozen_tasks: list[dict],
+    frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]],
     schedule_time: datetime,
-) -> dict:
-    """试排主流程。返回 task_views / batch_views / conflicts / 汇总计数。"""
+) -> tuple[dict[str, _ResourceState], list[tuple[SchedTask, Occupation]]]:
+    """一次确定性 EDF 贪心排程。返回 (资源状态, 已排任务及占用)。"""
     states = {cfg.resource_id: _ResourceState(cfg, schedule_time)
               for cfg in resources}
-    dropped_frozen = 0
     for occ in frozen_batches:
         st = states.get(occ.resource_id)
-        if st is None:
-            dropped_frozen += 1  # 资源已不在当前配置中：占用不再约束
-            continue
-        st.occs.append(occ)
-
-    # 已签发的前处理批次结束时刻：分析任务的前驱约束
-    frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]] = {}
-    for t in frozen_tasks:
-        frozen_intervals[(t["sample_id"], t["item"], t["phase"])] = (
-            datetime.fromisoformat(t["start"]),
-            datetime.fromisoformat(t["end"]),
-        )
+        if st is not None:
+            st.occs.append(occ)
 
     stations = sorted(
         (s for s in states.values() if s.cfg.kind == ResourceKind.PRETREATMENT),
@@ -376,16 +452,6 @@ def compute_schedule(
     instruments = sorted(
         (s for s in states.values() if s.cfg.kind == ResourceKind.INSTRUMENT),
         key=lambda s: s.rid,
-    )
-
-    # 按时钟分组；EDF（时钟最早截止）+ 确定性 tie-break
-    by_clock: dict[tuple[str, str], dict[str, SchedTask]] = {}
-    for t in tasks:
-        by_clock.setdefault((t.sample_id, t.item), {})[t.phase] = t
-    clock_order = sorted(
-        by_clock.items(),
-        key=lambda kv: (min(x.deadline for x in kv[1].values()),
-                        kv[0][0], kv[0][1]),
     )
 
     batch_ids: dict[str, set[str]] = {rid: set() for rid in states}
@@ -412,20 +478,14 @@ def compute_schedule(
         return occ
 
     placed: list[tuple[SchedTask, Occupation]] = []
-    conflicts: list[dict] = []
-
-    for (sid, item), phases in clock_order:
+    for (sid, item), phases in _clock_order(tasks):
         pre = phases.get(PRETREATMENT)
         ana = phases.get(ANALYSIS)
         pre_end: Optional[datetime] = None
         if pre is not None:
             best = _best_placement(stations, pre, schedule_time, pre.deadline)
             if best is None:
-                # 前处理无法准时 -> 同一时钟的分析连带受阻，不再尝试
-                affected = [_affected(pre)] + ([_affected(ana)] if ana else [])
-                conflicts.append(
-                    _make_conflict(pre, stations, schedule_time, affected))
-                continue
+                continue  # 前处理无法准时 -> 同一时钟的分析连带受阻
             occ = apply(best, pre)
             placed.append((pre, occ))
             pre_end = occ.end
@@ -439,11 +499,136 @@ def compute_schedule(
                     ready = fz[1]  # 前处理已签发冻结：按冻结批次结束时刻
             best = _best_placement(instruments, ana, ready, ana.deadline)
             if best is None:
-                conflicts.append(
-                    _make_conflict(ana, instruments, ready, [_affected(ana)]))
                 continue
             occ = apply(best, ana)
             placed.append((ana, occ))
+    return states, placed
+
+
+def _on_time_clocks(
+    placed: list[tuple[SchedTask, Occupation]],
+    all_tasks: list[SchedTask],
+) -> int:
+    """准时时钟数：时钟的全部待排任务都已排入（排入即不晚于截止）。"""
+    placed_keys = {t.key for t, _ in placed}
+    by_clock: dict[tuple[str, str], list[str]] = {}
+    for t in all_tasks:
+        by_clock.setdefault((t.sample_id, t.item), []).append(t.key)
+    return sum(
+        1 for keys in by_clock.values()
+        if all(k in placed_keys for k in keys)
+    )
+
+
+def _total_switches(states: dict[str, _ResourceState]) -> int:
+    total = 0
+    for st in states.values():
+        seq = st.sorted_occs()
+        total += sum(
+            1 for i in range(1, len(seq))
+            if seq[i - 1].method != seq[i].method
+        )
+    return total
+
+
+# ------------------------------------------------------------- 主流程 ----
+
+def compute_schedule(
+    *,
+    tasks: list[SchedTask],
+    resources: list[ResourceConfig],
+    frozen_batches: list[Occupation],
+    frozen_tasks: list[dict],
+    schedule_time: datetime,
+) -> dict:
+    """试排主流程。返回 task_views / batch_views / conflicts / 汇总计数。"""
+    known = {cfg.resource_id for cfg in resources}
+    active_frozen = [o for o in frozen_batches if o.resource_id in known]
+    # 资源已被新配置移除的已签发批次：保留冻结记录（不再约束新排）
+    orphan_batches = [o for o in frozen_batches if o.resource_id not in known]
+
+    # 已签发的前处理批次结束时刻：分析任务的前驱约束
+    frozen_intervals: dict[tuple[str, str, str], tuple[datetime, datetime]] = {}
+    for t in frozen_tasks:
+        frozen_intervals[(t["sample_id"], t["item"], t["phase"])] = (
+            datetime.fromisoformat(t["start"]),
+            datetime.fromisoformat(t["end"]),
+        )
+
+    states, placed = _greedy_place(
+        tasks=tasks,
+        resources=resources,
+        frozen_batches=active_frozen,
+        frozen_intervals=frozen_intervals,
+        schedule_time=schedule_time,
+    )
+
+    all_clocks = sorted({(t.sample_id, t.item) for t in tasks})
+
+    def metric(
+        st: dict[str, _ResourceState],
+        pl: list[tuple[SchedTask, Occupation]],
+    ) -> tuple[int, int]:
+        # 字典序目标：准时时钟数越大越好；并列时切换数越少越好
+        return (_on_time_clocks(pl, tasks), -_total_switches(st))
+
+    best_metric = metric(states, placed)
+    if best_metric[0] < len(all_clocks):
+        # 爬山修复：舍弃单个时钟重排，字典序更优即接受（如长切换时间下
+        # 舍弃独占批次的一个项目，让两个同方法项目合批准时完成）
+        improved = True
+        guard = 0
+        while improved and guard < _MAX_REPAIRS:
+            improved = False
+            guard += 1
+            for ck in all_clocks:
+                reduced = [
+                    t for t in tasks if (t.sample_id, t.item) != ck
+                ]
+                states2, placed2 = _greedy_place(
+                    tasks=reduced,
+                    resources=resources,
+                    frozen_batches=active_frozen,
+                    frozen_intervals=frozen_intervals,
+                    schedule_time=schedule_time,
+                )
+                m2 = metric(states2, placed2)
+                if m2 > best_metric:
+                    states, placed, best_metric = states2, placed2, m2
+                    improved = True
+                    break
+
+    stations = sorted(
+        (s for s in states.values() if s.cfg.kind == ResourceKind.PRETREATMENT),
+        key=lambda s: s.rid,
+    )
+    instruments = sorted(
+        (s for s in states.values() if s.cfg.kind == ResourceKind.INSTRUMENT),
+        key=lambda s: s.rid,
+    )
+
+    # 针对最终占用生成冲突（前处理未排 -> 分析连带受阻）
+    placed_by_key = {t.key: occ for t, occ in placed}
+    conflicts: list[dict] = []
+    for (sid, item), phases in _clock_order(tasks):
+        pre = phases.get(PRETREATMENT)
+        ana = phases.get(ANALYSIS)
+        pre_occ = placed_by_key.get(pre.key) if pre is not None else None
+        if pre is not None and pre_occ is None:
+            affected = [_affected(pre)] + ([_affected(ana)] if ana else [])
+            conflicts.append(
+                _make_conflict(pre, stations, schedule_time, affected))
+            continue
+        if ana is not None and ana.key not in placed_by_key:
+            ready = schedule_time
+            if pre_occ is not None:
+                ready = pre_occ.end
+            else:
+                fz = frozen_intervals.get((sid, item, PRETREATMENT))
+                if fz is not None and fz[1] > ready:
+                    ready = fz[1]
+            conflicts.append(
+                _make_conflict(ana, instruments, ready, [_affected(ana)]))
 
     task_views: list[dict] = []
     for task, occ in placed:
@@ -486,6 +671,21 @@ def compute_schedule(
                 "frozen": occ.frozen,
                 "switch_before_minutes": switch_before,
             })
+    # 孤立冻结批次：资源已不在配置中，按已签发版本的原样保留
+    for occ in sorted(orphan_batches,
+                      key=lambda o: (o.resource_id, o.start, o.batch_id)):
+        batch_views.append({
+            "batch_id": occ.batch_id,
+            "resource_id": occ.resource_id,
+            "kind": occ.kind or ResourceKind.INSTRUMENT.value,
+            "method": occ.method,
+            "start": occ.start,
+            "end": occ.end,
+            "capacity": occ.capacity if occ.capacity is not None else 1,
+            "task_keys": sorted(occ.task_keys),
+            "frozen": True,
+            "switch_before_minutes": occ.switch_before_minutes,
+        })
     batch_views.sort(key=lambda b: (b["resource_id"], b["start"], b["batch_id"]))
 
     return {
@@ -493,5 +693,7 @@ def compute_schedule(
         "batch_views": batch_views,
         "conflicts": conflicts,
         "method_switches": total_switches,
-        "dropped_frozen": dropped_frozen,
+        "on_time_clocks": _on_time_clocks(placed, tasks),
+        "total_clocks": len(all_clocks),
+        "orphan_frozen": len(orphan_batches),
     }

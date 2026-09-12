@@ -158,6 +158,10 @@ def _frozen_overlay() -> tuple[
             end=datetime.fromisoformat(b["end"]),
             frozen=True,
             task_keys=list(b["task_keys"]),
+            # 资源被新配置移除时，按这些属性原样保留冻结批次
+            kind=b.get("kind"),
+            capacity=b.get("capacity"),
+            switch_before_minutes=b.get("switch_before_minutes", 0.0),
         )
         for b in issued.get("batches", [])
     ]
@@ -209,13 +213,15 @@ def run_schedule(req: ScheduleRequest, *, trial: bool) -> ScheduleResult:
         "scheduled": len(computed["task_views"]),
         "unscheduled": len(conflicts),
         "on_time": len(computed["task_views"]),
+        "on_time_clocks": computed["on_time_clocks"],
+        "total_clocks": computed["total_clocks"],
         "total_tasks": len(all_tasks),
         "frozen_tasks": len(frozen_task_views),
         "new_batches": sum(1 for b in batch_views if not b["frozen"]),
         "total_batches": len(batch_views),
         "method_switches": computed["method_switches"],
         "skipped_clocks": len(skipped),
-        "dropped_frozen_batches": computed["dropped_frozen"],
+        "orphan_frozen_batches": computed["orphan_frozen"],
     }
 
     result = ScheduleResult(

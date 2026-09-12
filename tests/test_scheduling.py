@@ -378,8 +378,10 @@ def test_issue_freezes_occupations_and_redrafts_only_new(client):
     added = {(c["sample_id"], c["item"], c["phase"])
              for c in d["changes"] if c["kind"] == "task_added"}
     assert added == {("b2", "cod", "pretreatment"), ("b2", "cod", "analysis")}
-    # b1 的冻结任务不产生任何变化
-    assert not [c for c in d["changes"] if c["sample_id"] == "b1"]
+    # b1 的占用本身不变（仅 frozen 标志随签发翻转是合法变化）
+    b1_changes = [c for c in d["changes"] if c["sample_id"] == "b1"]
+    assert all(c["kind"] == "field_changed" and c["field"] == "frozen"
+               for c in b1_changes)
 
     # 工作单：按资源分组、批次有序、含规则哈希
     wo = client.get(f"/api/v1/schedules/{v2['schedule_id']}/workorder").json()
@@ -485,6 +487,137 @@ def test_resource_version_label_conflict(client):
     assert g.status_code == 200
     assert g.json()["resource_set"]["resources"][0]["capacity"] == 4
     assert client.get("/api/v1/resources/ghost").status_code == 404
+
+
+# ============================================================== 回归：三缺陷 ----
+
+def test_global_ontime_beats_greedy_switch100(client):
+    """切换 100 分钟的反例：贪心保 A1（截止最早）会让 B1/B2 都超期；
+    全局目标应舍弃 A1，将 B1、B2 合批并准时完成（准时时钟数 2 > 1）。"""
+    from app.models import ItemRule, JudgmentRequest, ResourceConfig, ResourceSet, RuleSet
+    rules = RuleSet(version="SR-G", items=[
+        ItemRule(item="a", pretreatment_minutes=None, analysis_minutes=200),
+        ItemRule(item="b", pretreatment_minutes=None, analysis_minutes=219),
+    ])
+    samples = [
+        mk_sample("sA", ["a"], {"a": "mA"}),
+        mk_sample("sB1", ["b"], {"b": "mB"}),
+        mk_sample("sB2", ["b"], {"b": "mB"}),
+    ]
+    req = JudgmentRequest(eval_time=dt(30), rule_set=rules, samples=samples,
+                          idempotency_key="g1")
+    r = client.post("/api/v1/judgments", json=req.model_dump(mode="json"))
+    assert r.status_code == 201, r.text
+    rs = ResourceSet(version="LAB-G", resources=[
+        ResourceConfig(resource_id="IC-1", kind="instrument",
+                       methods=["mA", "mB"], capacity=2, task_minutes=60,
+                       switch_minutes=100, windows=[W(0, 2880)]),
+    ])
+    post_resources(client, rs)
+    body = trial(client, 30).json()
+    # A1 被舍弃 -> 整体 infeasible，但 B1/B2 合批准时
+    assert body["status"] == "infeasible"
+    tasks = task_map(body)
+    assert ("sA", "a", "analysis") not in tasks
+    b1 = tasks[("sB1", "b", "analysis")]
+    b2 = tasks[("sB2", "b", "analysis")]
+    assert b1["batch_id"] == b2["batch_id"]          # 合批
+    assert b1["start"] == izo(30) and b1["end"] == izo(90)
+    assert b1["on_time"] is True and b2["on_time"] is True
+    # A1 成为冲突：B 批 [30,90) + 切换 100 -> 最早 [190,250)，晚于截止 200
+    assert len(body["conflicts"]) == 1
+    cf = body["conflicts"][0]
+    assert cf["sample_id"] == "sA" and cf["item"] == "a"
+    assert cf["reason"] == "deadline_miss"
+    assert cf["resource_id"] == "IC-1"
+    assert cf["interval"] == {"start": izo(190), "end": izo(250)}
+    assert cf["minutes_late"] == 50
+    # 字典序目标：准时时钟数最大化（2），切换数 0
+    assert body["summary"]["on_time_clocks"] == 2
+    assert body["summary"]["total_clocks"] == 3
+    assert body["summary"]["method_switches"] == 0
+    # 相同输入重跑结果稳定
+    assert trial(client, 30).json()["content_hash"] == body["content_hash"]
+
+
+def test_removed_resource_keeps_frozen_batches(client):
+    """资源版本移除旧 resource_id：已签发批次仍在返回批次、后续计划与
+    JSON 工作单中保留（冻结占用不丢）。"""
+    from app.models import ResourceConfig, ResourceSet
+    receive(client, [mk_sample("b1", ["cod"], {"cod": "hj828"})], ik="r1")
+    post_resources(client)  # LAB-1: PT-1 + IC-1 + IC-2
+    v1 = issue(client, 30, idempotency_key="sch-r1").json()
+    assert v1["version_no"] == 1
+    ic1_batch = [b for b in v1["batches"] if b["resource_id"] == "IC-1"]
+    assert len(ic1_batch) == 1
+
+    # 新资源版本移除 IC-1/IC-2，只剩 PT-1 与新仪器 IC-9
+    rs2 = ResourceSet(version="LAB-2", resources=[
+        ResourceConfig(resource_id="PT-1", kind="pretreatment", capacity=4,
+                       task_minutes=30, switch_minutes=10, windows=[W(0, 2880)]),
+        ResourceConfig(resource_id="IC-9", kind="instrument", methods=["hj828"],
+                       capacity=2, task_minutes=45, switch_minutes=20,
+                       windows=[W(0, 2880)]),
+    ])
+    post_resources(client, rs2)
+    receive(client, [mk_sample("b2", ["cod"], {"cod": "hj828"})], ik="r2")
+
+    body = trial(client, 40, resource_version="LAB-2").json()
+    # 已签发的 IC-1 批次仍保留在返回批次中（冻结、原样）
+    kept = [b for b in body["batches"] if b["resource_id"] == "IC-1"]
+    assert len(kept) == 1
+    assert kept[0]["frozen"] is True
+    assert kept[0]["batch_id"] == ic1_batch[0]["batch_id"]
+    assert kept[0]["start"] == ic1_batch[0]["start"]
+    assert kept[0]["end"] == ic1_batch[0]["end"]
+    assert kept[0]["kind"] == "instrument"
+    assert body["summary"]["orphan_frozen_batches"] == 1
+    tasks = task_map(body)
+    # b1 的冻结任务仍在且指向 IC-1
+    assert tasks[("b1", "cod", "analysis")]["frozen"] is True
+    assert tasks[("b1", "cod", "analysis")]["resource_id"] == "IC-1"
+    # b2 的分析落到新仪器 IC-9（资源不重叠约束对新资源生效）
+    assert tasks[("b2", "cod", "analysis")]["resource_id"] == "IC-9"
+    assert tasks[("b2", "cod", "analysis")]["frozen"] is False
+
+    # 签发 v2：后续计划与工作单仍保留 IC-1 冻结批次
+    v2 = issue(client, 40, resource_version="LAB-2",
+               idempotency_key="sch-r2").json()
+    assert any(b["resource_id"] == "IC-1" and b["frozen"]
+               for b in v2["batches"])
+    body3 = trial(client, 50).json()  # 缺省用最新资源 LAB-2
+    assert any(b["resource_id"] == "IC-1" and b["frozen"]
+               for b in body3["batches"])
+    wo = client.get(f"/api/v1/schedules/{v2['schedule_id']}/workorder").json()
+    res = {r["resource_id"]: r for r in wo["resources"]}
+    assert "IC-1" in res
+    assert res["IC-1"]["batches"][0]["frozen"] is True
+    assert res["IC-1"]["batches"][0]["tasks"]
+
+
+def test_window_shorter_than_task_reports_earliest_resource_interval(client):
+    """兼容资源窗口短于任务时长：冲突须给出最早的 resource_id、interval
+    与受影响时钟。"""
+    from app.models import ResourceConfig, ResourceSet
+    rs = ResourceSet(version="LAB-SHORT", resources=[
+        ResourceConfig(resource_id="IC-2", kind="instrument", methods=["hj535"],
+                       capacity=2, task_minutes=60, switch_minutes=15,
+                       windows=[W(0, 45)]),
+    ])
+    receive(client, [mk_sample("b1", ["oil"], {"oil": "hj535"})], ik="short")
+    post_resources(client, rs)
+    body = trial(client, 30).json()
+    assert body["status"] == "infeasible"
+    assert len(body["conflicts"]) == 1
+    cf = body["conflicts"][0]
+    assert cf["reason"] == "window_unavailable"
+    # 最早空闲区间 [30,45)（窗口被排程基准裁剪后仅 15 分钟 < 任务 60 分钟）
+    assert cf["resource_id"] == "IC-2"
+    assert cf["interval"] == {"start": izo(30), "end": izo(45)}
+    assert [(a["sample_id"], a["item"], a["phase"])
+            for a in cf["affected_clocks"]] == [("b1", "oil", "analysis")]
+    assert body["earliest_conflict"]["resource_id"] == "IC-2"
+    assert body["earliest_conflict"]["interval"] == cf["interval"]
 
 
 # ============================================================== 单元 ----
