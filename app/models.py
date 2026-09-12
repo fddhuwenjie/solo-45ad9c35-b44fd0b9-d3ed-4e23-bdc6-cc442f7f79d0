@@ -89,7 +89,34 @@ class AnalysisEvent(BaseModel):
 
 class ItemRule(BaseModel):
     item: str
+    rule_id: str = Field(
+        "", description="规则项稳定标识（同一项目的不同适用规则以此区分）；为空取 item"
+    )
     item_name: Optional[str] = None
+    # 生效区间：半开 [effective_from, effective_to)，None 表示该侧无界
+    effective_from: Optional[datetime] = Field(
+        None, description="生效起始时刻（含）；按样品原始采样时刻筛选"
+    )
+    effective_to: Optional[datetime] = Field(
+        None, description="生效结束时刻（不含）"
+    )
+    # 适用范围：空列表表示该维度通配（任意值均可）
+    matrices: list[str] = Field(
+        default_factory=list,
+        description="适用样品基质，如 surface_water / groundwater / wastewater；空=通配",
+    )
+    methods: list[str] = Field(
+        default_factory=list,
+        description="适用分析方法（样品按项目提交 item_methods），如 hj828；空=通配",
+    )
+    containers: list[str] = Field(
+        default_factory=list,
+        description="适用容器，如 glass_amber / pe_bottle；空=通配",
+    )
+    storage_conditions: list[str] = Field(
+        default_factory=list,
+        description="适用保存条件，如 refrigerated_4c / dark / acidified；空=通配",
+    )
     min_temp_c: float = -1_000_000.0
     max_temp_c: float = 1_000_000.0
     pretreatment_minutes: Optional[float] = Field(
@@ -99,6 +126,26 @@ class ItemRule(BaseModel):
     required_preservation: list[str] = Field(default_factory=list)
     continuous_basis: ContinuousBasis = ContinuousBasis.END
     note: Optional[str] = None
+
+    @field_validator("effective_from", "effective_to")
+    @classmethod
+    def _tz(cls, v: Optional[datetime]) -> Optional[datetime]:
+        return as_utc(v) if v is not None else None
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "ItemRule":
+        if not self.rule_id:
+            object.__setattr__(self, "rule_id", self.item)
+        if (
+            self.effective_from is not None
+            and self.effective_to is not None
+            and self.effective_to <= self.effective_from
+        ):
+            raise ValueError(
+                f"规则项 {self.rule_id}(item={self.item}) 生效区间非法："
+                "effective_to 必须晚于 effective_from（半开区间）"
+            )
+        return self
 
 
 class RuleSet(BaseModel):
@@ -110,12 +157,25 @@ class RuleSet(BaseModel):
     note: Optional[str] = None
 
     @model_validator(mode="after")
-    def _unique_items(self) -> "RuleSet":
-        names = [r.item for r in self.items]
-        if len(names) != len(set(names)):
-            raise ValueError("规则集中 item 不得重复")
+    def _unique_and_non_overlapping(self) -> "RuleSet":
         if not self.items:
             raise ValueError("规则集至少包含一条项目规则")
+        ids = [r.rule_id for r in self.items]
+        if len(ids) != len(set(ids)):
+            dup = sorted({x for x in ids if ids.count(x) > 1})
+            raise ValueError(f"规则集中 rule_id 不得重复: {dup}")
+        # 同一规则集内部即不得存在适用范围重叠（会导致正式接收多候选）
+        from .matching import scope_conflict
+
+        for i, r1 in enumerate(self.items):
+            for r2 in self.items[i + 1:]:
+                c = scope_conflict(r1, r2)
+                if c is not None:
+                    raise ValueError(
+                        f"规则集内部适用范围冲突：rule_id={r1.rule_id} 与 "
+                        f"{r2.rule_id}（item={r1.item}）在生效区间与适用条件上"
+                        "同时命中，无法保证唯一匹配"
+                    )
         return self
 
 
@@ -124,6 +184,16 @@ class Sample(BaseModel):
     kind: SampleKind
     items: list[str] = Field(..., description="该样品（瓶）要测的项目")
     container: Optional[str] = Field(None, description="容器，如 glass_amber / pe_bottle")
+    matrix: Optional[str] = Field(
+        None, description="样品基质，如 surface_water / groundwater / wastewater"
+    )
+    storage_condition: Optional[str] = Field(
+        None, description="实际保存条件，如 refrigerated_4c / dark / acidified"
+    )
+    item_methods: dict[str, str] = Field(
+        default_factory=dict,
+        description="按项目提交的分析方法，键为项目，值如 hj828 / hj535；可只覆盖部分项目",
+    )
     sampling_start: datetime
     sampling_end: datetime
     parent_ids: list[str] = Field(
@@ -162,7 +232,21 @@ class Sample(BaseModel):
             raise ValueError("分样必须提供 parent_ids（母体）")
         if not self.items:
             raise ValueError("样品至少包含一个分析项目")
+        unknown = [k for k in self.item_methods if k not in self.items]
+        if unknown:
+            raise ValueError(f"样品 {self.id} 的 item_methods 含未申报项目: {unknown}")
         return self
+
+
+class CandidateSelection(BaseModel):
+    """试算时强制指定某个时钟使用的规则项（对照用，不形成合规结论）。"""
+    rule_id: str = Field(..., description="强制使用的规则项 rule_id")
+    version: Optional[str] = Field(
+        None, description="规则集可读版本；提供时必须命中且与 content_hash 一致"
+    )
+    content_hash: Optional[str] = Field(
+        None, description="规则集内容哈希；提供时必须命中"
+    )
 
 
 class JudgmentRequest(BaseModel):
@@ -179,10 +263,17 @@ class JudgmentRequest(BaseModel):
         ge=0,
     )
     rule_version: Optional[str] = Field(
-        None, description="引用已登记的规则版本；与 rule_set 二选一"
+        None,
+        description="额外纳入候选池的已登记规则版本；与 rule_set 均可省略"
+        "（省略时候选池为全部已登记规则）",
     )
     rule_set: Optional[RuleSet] = Field(
-        None, description="随请求携带的规则集（试算或登记新版本用）"
+        None, description="随请求携带的规则集（试算对照或登记新版本用），并入候选池"
+    )
+    selected_candidates: Optional[dict[str, CandidateSelection]] = Field(
+        None,
+        description="试算专用：按样品—项目显式指定候选规则进行对照，"
+        "键为 'sample_id/item'；正式接收提供该字段将被拒绝",
     )
     samples: list[Sample]
 
@@ -193,8 +284,6 @@ class JudgmentRequest(BaseModel):
 
     @model_validator(mode="after")
     def _rules_and_refs(self) -> "JudgmentRequest":
-        if self.rule_set is None and not self.rule_version:
-            raise ValueError("必须提供 rule_set 或 rule_version 之一")
         if self.rule_set is not None and self.rule_version:
             if self.rule_set.version != self.rule_version:
                 raise ValueError("rule_set.version 与 rule_version 不一致")
@@ -213,7 +302,16 @@ class JudgmentRequest(BaseModel):
             for s in self.samples:
                 missing = [i for i in s.items if i not in known]
                 if missing:
-                    raise ValueError(f"样品 {s.id} 的项目在规则集中缺失: {missing}")
+                    raise ValueError(f"样品 {s.id} 的项目在携带规则集中缺失: {missing}")
+        if self.selected_candidates:
+            idset_pairs = {
+                f"{s.id}/{i}" for s in self.samples for i in s.items
+            }
+            bad = [k for k in self.selected_candidates if k not in idset_pairs]
+            if bad:
+                raise ValueError(
+                    f"selected_candidates 只能指定本请求内的样品—项目时钟: {bad}"
+                )
         return self
 
 
@@ -254,6 +352,7 @@ class ClockStatus(str, Enum):
     CRITICAL = "critical"
     OVERDUE = "overdue"
     COMPLETED = "completed"
+    INDETERMINATE = "indeterminate"  # 无唯一适用规则/保存动作不足：不得形成合规结论
     INVALID = "invalid"
 
 
@@ -275,6 +374,58 @@ class PhaseInfo(BaseModel):
     rule_source: str
 
 
+class FieldSource(BaseModel):
+    field: str
+    value: Optional[str]
+    source_sample_id: str = Field(..., description="取值实际来自的样品（沿来源链可能是祖先）")
+    source_field: str
+    note: Optional[str] = None
+
+
+class UnmetCondition(BaseModel):
+    dimension: Literal[
+        "effective_time", "matrix", "method", "container", "storage_condition"
+    ]
+    required: list
+    actual: Optional[str] = None
+    field_sources: list[FieldSource] = Field(
+        default_factory=list,
+        description="参与该维度判定的实际字段及来源样品（含沿来源链回退的取值）",
+    )
+
+
+class ClockRuleRef(BaseModel):
+    """冻结到单个时钟的规则项身份。"""
+    version: str
+    content_hash: str
+    rule_id: str
+    item: str
+
+
+class CandidateRuleView(BaseModel):
+    version: str
+    content_hash: str
+    rule_id: str
+    item: str
+    item_name: Optional[str] = None
+    applies: bool = Field(..., description="是否满足全部适用条件")
+    unmet: list[UnmetCondition] = Field(default_factory=list)
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+    matrices: list[str] = Field(default_factory=list)
+    methods: list[str] = Field(default_factory=list)
+    containers: list[str] = Field(default_factory=list)
+    storage_conditions: list[str] = Field(default_factory=list)
+    analysis_minutes: Optional[float] = None
+    pretreatment_minutes: Optional[float] = None
+
+
+class MatchContext(BaseModel):
+    """规则筛选使用的实际条件；field_sources 逐字段说明取值来源。"""
+    basis_time: datetime
+    field_sources: list[FieldSource] = Field(default_factory=list)
+
+
 class ClockResult(BaseModel):
     sample_id: str
     item: str
@@ -284,14 +435,31 @@ class ClockResult(BaseModel):
     merged_at: Optional[datetime]
     status: ClockStatus
     conforming: bool
+    conclusive: bool = Field(
+        ..., description="是否允许形成合规结论：规则不唯一/保存动作不足/结构失效时为 false"
+    )
     phases: list[PhaseInfo]
     next_action_deadline: Optional[datetime]
     next_action: Optional[Literal["pretreatment", "analysis", "transfer"]]
     remaining_minutes: Optional[int]
     latest_operation_at: Optional[datetime] = Field(
-        ..., description="该项目理论最晚操作时刻（分析截止）"
+        None, description="该项目理论最晚操作时刻（分析截止）；无适用规则时为空"
     )
     rule_source: str
+    matched_rule: Optional[ClockRuleRef] = Field(
+        None, description="唯一匹配并冻结到本时钟的规则项（无匹配/多候选时为空）"
+    )
+    match_status: Literal["unique", "none", "ambiguous", "forced", "forced_missing"] = Field(
+        "unique",
+        description="unique=唯一匹配；none=无候选；ambiguous=多同等候选；"
+        "forced=试算强制；forced_missing=试算强制的规则不在候选池",
+    )
+    candidates: list[CandidateRuleView] = Field(
+        default_factory=list, description="适用筛选所见候选规则（含未满足条件与字段来源）"
+    )
+    match_context: Optional[MatchContext] = Field(
+        None, description="本次筛选使用的实际条件与各字段来源"
+    )
     derivation: list[DerivationStep]
 
 
@@ -305,6 +473,7 @@ class Violation(BaseModel):
         "missing_preservation",
         "late_transfer",
         "item_rule_missing",
+        "rule_applicability",
     ]
     sample_id: str
     items: list[str]
@@ -347,7 +516,17 @@ class JudgmentResult(BaseModel):
     request_id: Optional[str]
     eval_time: datetime
     created_at: datetime
-    rule: RuleRef
+    rule: RuleRef = Field(
+        ..., description="代表性规则集（包内时钟冻结规则的首个，兼容旧客户端）"
+    )
+    rules: list[RuleRef] = Field(
+        default_factory=list,
+        description="本判定包各时钟实际冻结的全部规则集（按 content_hash 去重）",
+    )
+    selection_policy: dict = Field(
+        default_factory=dict,
+        description="规则适用性匹配策略说明（基准时刻、维度、半开区间、强制候选等）",
+    )
     basis_policy: dict
     summary: dict
     clocks: list[ClockResult]

@@ -6,19 +6,31 @@
 * 分样（aliquot）继承母体基准与全部历史；合样（composite）取组成样中最早的
   基准，``merged_at`` 之前的历史共享、之后独立——分析期限绝不会被重置。
 * 前处理事件只结束“预处理”阶段；“分析”期限始终从原始基准连续计算。
+
+规则不再由调用方整包指定：引擎接收一个候选池（全部已登记规则集 + 请求携带集），
+按时钟解析出的**原始采样时刻**（沿来源链）与样品实际条件（基质、该项目的分析
+方法、容器、保存条件）筛选规则项。唯一匹配才交给时钟计算；无匹配/多同等候选时
+时钟为 ``indeterminate``，响应携带候选、未满足条件与字段来源，不形成合规结论。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+from .matching import DIMENSIONS, evaluate_applicability
 from .models import (
+    CandidateRuleView,
     ClockResult,
+    ClockRuleRef,
     ClockStatus,
     ContinuousBasis,
     DerivationStep,
+    FieldSource,
+    ItemRule,
     JudgmentRequest,
     JudgmentResult,
+    MatchContext,
     PhaseInfo,
     PhaseStatus,
     PriorityBatch,
@@ -26,6 +38,7 @@ from .models import (
     RuleSet,
     Sample,
     StatusChange,
+    UnmetCondition,
     Violation,
 )
 
@@ -40,10 +53,22 @@ def _remaining_minutes(deadline: datetime, eval_time: datetime) -> int:
     return int(round((deadline - eval_time).total_seconds() / 60.0))
 
 
+@dataclass(frozen=True)
+class PoolEntry:
+    """候选池中的一条项目规则。"""
+    version: str
+    content_hash: str
+    rule: ItemRule
+    adhoc: bool = False  # 请求携带（未登记）规则集
+
+
 class _Engine:
-    def __init__(self, request: JudgmentRequest, rule_set: RuleSet):
+    def __init__(self, request: JudgmentRequest, pool: list[PoolEntry]):
         self.req = request
-        self.rules = {r.item: r for r in rule_set.items}
+        self.pool = pool
+        self.by_item: dict[str, list[PoolEntry]] = {}
+        for e in pool:
+            self.by_item.setdefault(e.rule.item, []).append(e)
         self.samples: dict[str, Sample] = {s.id: s for s in request.samples}
         self.children: dict[str, list[str]] = {sid: [] for sid in self.samples}
         for s in request.samples:
@@ -62,8 +87,8 @@ class _Engine:
                     self.break_nodes.add(s.id)
         self.break_tainted = self._downward(set(self.break_nodes))
 
-        # 基准解析记忆：sid -> {item: (origin_id, basis_kind, time, merged_at)}
-        self._basis_memo: dict[str, dict[str, tuple]] = {}
+        # 基准解析记忆：(sid, item, basis) -> (origin_id, basis_kind, time, merged_at)
+        self._basis_memo: dict[tuple[str, str, str], tuple] = {}
 
     # -------------------------------------------------------- 图辅助 ----
 
@@ -176,8 +201,9 @@ class _Engine:
 
     # ------------------------------------------------------- 基准 ----
 
-    def _root_basis(self, s: Sample, item: str) -> tuple[str, str, datetime]:
-        rule = self.rules.get(item)
+    def _root_basis(
+        self, s: Sample, item: str, rule: Optional[ItemRule]
+    ) -> tuple[str, str, datetime]:
         use_start = (
             s.kind.value == "continuous"
             and rule is not None
@@ -188,13 +214,25 @@ class _Engine:
         return s.id, "sampling_end", s.sampling_end
 
     def resolve_basis(
-        self, sid: str, item: str, stack: Optional[list[str]] = None
+        self,
+        sid: str,
+        item: str,
+        rule: Optional[ItemRule] = None,
+        stack: Optional[list[str]] = None,
     ) -> tuple[str, str, datetime, Optional[datetime]]:
-        """返回 (origin_sample_id, basis_kind, basis_time, merged_at)。"""
+        """返回 (origin_sample_id, basis_kind, basis_time, merged_at)。
+
+        连续样取开始还是结束取决于候选规则自身的 continuous_basis，因此基准
+        解析按 (sid, item, basis) 记忆。
+        """
         stack = stack or []
-        memo = self._basis_memo.setdefault(sid, {})
-        if item in memo:
-            return memo[item]
+        key = (
+            sid, item,
+            rule.continuous_basis.value if rule is not None else ContinuousBasis.END.value,
+        )
+        memo = self._basis_memo
+        if key in memo:
+            return memo[key]
         if sid in stack:
             raise _Cycle(sid)
         s = self.samples.get(sid)
@@ -206,17 +244,17 @@ class _Engine:
         if not s.parent_ids:
             if s.kind.value in ("aliquot", "composite"):
                 raise _Break(sid)
-            res = (*self._root_basis(s, item), None)
-            memo[item] = res
+            res = (*self._root_basis(s, item, rule), None)
+            memo[key] = res
             return res
 
         parent_bases = []
         for p in s.parent_ids:
-            parent_bases.append(self.resolve_basis(p, item, stack + [sid]))
+            parent_bases.append(self.resolve_basis(p, item, rule, stack + [sid]))
         chosen = min(parent_bases, key=lambda b: b[2])
         merged_at = s.merged_at if s.kind.value == "composite" else None
         res = (chosen[0], chosen[1], chosen[2], merged_at)
-        memo[item] = res
+        memo[key] = res
         return res
 
     # ------------------------------------------------- 共享历史收集 ----
@@ -225,9 +263,10 @@ class _Engine:
         """沿来源链收集该时钟可见的历史。
 
         穿过合样边界时，只取该合样 ``merged_at`` 之前（含）的组成样记录；
-        穿过分样边界不过滤（同一段共享历史）。
+        穿过分样边界不过滤（同一段共享历史）。防腐动作另外记录动作来源样品。
         """
         pres, temps, pre, ana, xfer = [], [], [], [], []
+        pres_sources: dict[str, list[dict]] = {}
         seen: set[str] = set()
         stack: list[tuple[str, Optional[datetime]]] = [(sid, None)]
         walls: list[str] = []
@@ -243,7 +282,12 @@ class _Engine:
             def ok(t: datetime) -> bool:
                 return wall is None or t <= wall
 
-            pres += [a for a in node.preservation if ok(a.time)]
+            for a in node.preservation:
+                if ok(a.time):
+                    pres.append(a)
+                    pres_sources.setdefault(a.name, []).append(
+                        {"sample_id": cur, "time": iso(a.time)}
+                    )
             temps += [t for t in node.temperature if ok(t.time)]
             pre += [e for e in node.pretreatments if ok(e.time)]
             ana += [e for e in node.analyses if ok(e.time)]
@@ -267,7 +311,188 @@ class _Engine:
         return {
             "preservation": pres, "temperature": temps, "pretreatments": pre,
             "analyses": ana, "transfers": xfer, "wall_notes": walls,
-            "seen": sorted(seen),
+            "pres_sources": pres_sources, "seen": sorted(seen),
+        }
+
+    # ----------------------------------------------- 适用条件与来源 ----
+
+    def _resolve_condition(
+        self, sid: str, item: str, field: str
+    ) -> tuple[Optional[str], str, str]:
+        """沿来源链解析样品实际条件（本样品优先，其次祖先）。
+
+        返回 (值, 来源样品id, 来源字段名)；整条链都未提交时值为 None。
+        """
+        queue = [sid]
+        visited: set[str] = set()
+        while queue:
+            cur = queue.pop(0)
+            if cur in visited or cur not in self.samples:
+                continue
+            visited.add(cur)
+            node = self.samples[cur]
+            if field == "method":
+                val = node.item_methods.get(item)
+                src_field = f"item_methods.{item}"
+            else:
+                val = getattr(node, field)
+                src_field = field
+            if val is not None:
+                return val, cur, src_field
+            queue.extend(node.parent_ids)
+        return None, sid, (f"item_methods.{item}" if field == "method" else field)
+
+    def _condition_sources(
+        self, sid: str, item: str, origin_id: str, basis_kind: str,
+        basis_time: datetime
+    ) -> dict[str, FieldSource]:
+        """构建全部匹配维度的字段来源（取值可能为 None）。"""
+        sources: dict[str, FieldSource] = {}
+        sources["effective_time"] = FieldSource(
+            field="basis_time", value=iso(basis_time), source_sample_id=origin_id,
+            source_field=basis_kind,
+            note="原始采样时刻（沿来源链解析；连续样按规则 continuous_basis 取端）",
+        )
+        for dim in DIMENSIONS:
+            val, src_sid, src_field = self._resolve_condition(sid, item, dim)
+            sources[dim] = FieldSource(
+                field=dim, value=val, source_sample_id=src_sid,
+                source_field=src_field,
+                note=None if val is not None else "本样品及来源链均未提交，按缺失处理",
+            )
+        return sources
+
+    def _candidate_view(
+        self,
+        entry: PoolEntry,
+        basis: Optional[tuple],
+        sources: dict[str, FieldSource],
+    ) -> CandidateRuleView:
+        r = entry.rule
+        if basis is not None:
+            ctx = {
+                "basis_time": basis[2],
+                "matrix": sources["matrix"].value,
+                "method": sources["method"].value,
+                "container": sources["container"].value,
+                "storage_condition": sources["storage_condition"].value,
+            }
+            raw_unmet = evaluate_applicability(r, ctx)
+        else:
+            raw_unmet = [{"dimension": "effective_time",
+                          "required": [r.effective_from, r.effective_to],
+                          "actual": None}]
+        unmet = []
+        for u in raw_unmet:
+            dim = u["dimension"]
+            src = sources.get(dim)
+            unmet.append(UnmetCondition(
+                dimension=dim,
+                required=[iso(x) for x in u["required"]]
+                if dim == "effective_time" else list(u["required"]),
+                actual=iso(u["actual"]) if dim == "effective_time" else u["actual"],
+                field_sources=[src] if src else [],
+            ))
+        return CandidateRuleView(
+            version=entry.version, content_hash=entry.content_hash,
+            rule_id=r.rule_id, item=r.item, item_name=r.item_name,
+            applies=not unmet, unmet=unmet,
+            effective_from=r.effective_from, effective_to=r.effective_to,
+            matrices=list(r.matrices), methods=list(r.methods),
+            containers=list(r.containers),
+            storage_conditions=list(r.storage_conditions),
+            analysis_minutes=r.analysis_minutes,
+            pretreatment_minutes=r.pretreatment_minutes,
+        )
+
+    def _select_rule(
+        self, sid: str, item: str, forced: Optional[tuple]
+    ) -> dict:
+        """规则适用性匹配，返回选择结果包。
+
+        forced = (content_hash|None, version|None, rule_id)：试算强制对照，
+        只要求条目存在于候选池，不要求满足适用条件（对照本身就是看不适用规则）。
+        """
+        entries = list(self.by_item.get(item, []))
+        # 同 (content_hash, rule_id) 去重（重复发布的同一规则项）
+        dedup: dict[tuple[str, str], PoolEntry] = {}
+        for e in entries:
+            dedup.setdefault((e.content_hash, e.rule.rule_id), e)
+        entries = sorted(dedup.values(),
+                         key=lambda e: (e.version, e.rule.rule_id))
+
+        # 先用默认（end）基准解析一次：即使没有候选命中，也要用真实原始采样
+        # 时刻展示条件来源；成环/断档时才真正不可解析。
+        fallback_basis: Optional[tuple] = None
+        try:
+            fallback_basis = self.resolve_basis(sid, item, None)
+        except (_Cycle, _Break):
+            fallback_basis = None
+
+        # 逐条候选按其自身 continuous_basis 解析基准并判适用条件
+        views: list[CandidateRuleView] = []
+        applying: list[tuple[PoolEntry, tuple]] = []
+        resolved: dict[tuple, tuple] = {}  # entry key -> basis
+        sources: Optional[dict[str, FieldSource]] = None
+        basis_failed = fallback_basis is None
+        if fallback_basis is not None:
+            ob, bk, bt, _ = fallback_basis
+            sources = self._condition_sources(sid, item, ob, bk, bt)
+        else:
+            s = self.samples[sid]
+            sources = self._condition_sources(
+                sid, item, sid, "sampling_end", s.sampling_start
+            )
+        for e in entries:
+            try:
+                b = self.resolve_basis(sid, item, e.rule)
+            except (_Cycle, _Break):
+                b = None
+            if b is not None:
+                resolved[(e.content_hash, e.rule.rule_id)] = b
+                view = self._candidate_view(e, b, sources)
+                if view.applies:
+                    applying.append((e, b))
+            else:
+                view = self._candidate_view(e, None, sources)
+            views.append(view)
+
+        chosen: Optional[PoolEntry] = None
+        chosen_basis: Optional[tuple] = None
+        status = "unique"
+        if forced is not None:
+            f_hash, f_version, f_rule_id = forced
+            match = next(
+                (e for e in entries
+                 if e.rule.rule_id == f_rule_id
+                 and (f_hash is None or e.content_hash == f_hash)
+                 and (f_version is None or e.version == f_version)),
+                None,
+            )
+            if match is not None:
+                key = (match.content_hash, match.rule.rule_id)
+                chosen = match
+                chosen_basis = resolved.get(key) or fallback_basis
+                status = "forced"
+            else:
+                status = "forced_missing"
+        elif len(applying) == 1:
+            chosen, chosen_basis = applying[0]
+            status = "unique"
+        elif len(applying) == 0:
+            status = "none"
+        else:
+            status = "ambiguous"
+
+        # 无唯一匹配但基准本身可解析：回退基准用于展示（不用于算截止时刻）
+        display_basis = chosen_basis or fallback_basis
+
+        views.sort(key=lambda v: (not v.applies, v.version, v.rule_id))
+        return {
+            "entries": entries, "views": views, "chosen": chosen,
+            "chosen_basis": chosen_basis, "display_basis": display_basis,
+            "status": status,
+            "sources": sources, "basis_failed": basis_failed,
         }
 
     # ----------------------------------------------------- 单时钟 ----
@@ -284,35 +509,35 @@ class _Engine:
         invalid: bool,
     ) -> PhaseInfo:
         if limit is None:
-            status = (
+            pstatus = (
                 PhaseStatus.INVALID if invalid
                 else PhaseStatus.COMPLETED if done_at is not None
                 else PhaseStatus.PENDING
             )
             return PhaseInfo(
                 phase=phase, limit_minutes=None, deadline=None, done_at=done_at,
-                status=status, basis_time=basis_time, rule_source=rule_source,
+                status=pstatus, basis_time=basis_time, rule_source=rule_source,
             )
         deadline = basis_time + timedelta(minutes=limit)
         if invalid:
-            status = PhaseStatus.INVALID
+            pstatus = PhaseStatus.INVALID
             remaining = None
         elif done_at is not None:
-            status = (
+            pstatus = (
                 PhaseStatus.COMPLETED if done_at <= deadline else PhaseStatus.OVERDUE
             )
             remaining = None
         else:
             remaining = _remaining_minutes(deadline, eval_time)
             if eval_time > deadline:
-                status = PhaseStatus.OVERDUE
+                pstatus = PhaseStatus.OVERDUE
             elif timedelta(minutes=remaining) <= timedelta(minutes=critical_min):
-                status = PhaseStatus.CRITICAL
+                pstatus = PhaseStatus.CRITICAL
             else:
-                status = PhaseStatus.PENDING
+                pstatus = PhaseStatus.PENDING
         return PhaseInfo(
             phase=phase, limit_minutes=limit, deadline=deadline, done_at=done_at,
-            status=status, remaining_minutes=remaining, basis_time=basis_time,
+            status=pstatus, remaining_minutes=remaining, basis_time=basis_time,
             rule_source=rule_source,
         )
 
@@ -322,38 +547,72 @@ class _Engine:
         req = self.req
         raw_viol: list[dict] = []
         deriv: list[DerivationStep] = []
-        rule = self.rules.get(item)
-        rule_source = (
-            f"rule:{req.rule_set.version if req.rule_set else req.rule_version}"
-            f"#item={item}"
-            if rule is not None else f"missing#item={item}"
-        )
 
-        invalid = (
-            sid in self.cycle_tainted
-            or sid in self.break_tainted
-            or sid in self.inv_tainted
-        )
+        forced = None
+        sel = req.selected_candidates.get(f"{sid}/{item}") \
+            if req.selected_candidates else None
+        if sel is not None:
+            forced = (sel.content_hash, sel.version, sel.rule_id)
 
-        basis_time = origin_id = basis_kind = merged_at = None
-        try:
-            origin_id, basis_kind, basis_time, merged_at = self.resolve_basis(sid, item)
+        selection = self._select_rule(sid, item, forced)
+        rule = selection["chosen"].rule if selection["chosen"] else None
+        basis_tuple = selection["chosen_basis"]
+        display_basis = selection["display_basis"]
+        match_status = selection["status"]
+        sources = selection["sources"]
+        forced_missing = match_status == "forced_missing"
+
+        origin_id = basis_kind = basis_time = merged_at = None
+        if display_basis is not None:
+            origin_id, basis_kind, basis_time, merged_at = display_basis
             deriv.append(DerivationStep(
                 step="resolve_basis",
                 detail=(
                     f"{sid}/{item} 基准来自 {origin_id} 的 {basis_kind}="
                     f"{iso(basis_time)}" + (f"；合样墙 merged_at={iso(merged_at)}"
                                             if merged_at else "")
+                    + ("（仅用于展示，未参与截止计算）" if basis_tuple is None else "")
                 ),
             ))
-        except _Cycle as exc:
-            raw_viol.append(("source_cycle", sid, [item],
-                             f"样品 {sid} 的来源链成环（触及 {exc.sid}），基准不可解析",
-                             {"node": exc.sid}))
-        except _Break as exc:
-            raw_viol.append(("source_break", sid, [item],
-                             f"样品 {sid} 的来源 {exc.sid} 不在本批记录中（来源断档）",
-                             {"missing_parent": exc.sid}))
+
+        # 结构问题（成环/断档/真实时间倒置）：基准不可解析或时序非法。
+        # 注意：判定时刻之后的“未来记录”只逐时钟记 time_inversion 违规，
+        # 不进入 inv_tainted，因此不会把时钟整体置为失效（与旧行为一致）。
+        structural_invalid = (
+            sid in self.cycle_tainted or sid in self.break_tainted
+            or sid in self.inv_tainted
+        )
+        if basis_time is None:
+            if sid in self.cycle_tainted:
+                raw_viol.append(("source_cycle", sid, [item],
+                                 f"样品 {sid} 的来源链成环，基准不可解析",
+                                 {"node": sid}))
+            elif sid in self.break_tainted:
+                raw_viol.append(("source_break", sid, [item],
+                                 f"样品 {sid} 的来源不在本批记录中（来源断档），基准不可解析",
+                                 {}))
+
+        # 适用性匹配推导（候选/未满足条件/字段来源同时进入响应模型）
+        if rule is not None:
+            label = {"forced": "试算强制指定", "unique": "唯一匹配"}.get(
+                match_status, match_status)
+            deriv.append(DerivationStep(
+                step="match_rule",
+                detail=(
+                    f"候选 {len(selection['entries'])} 条，按原始采样时刻 "
+                    f"{iso(basis_time)} 与实际条件筛选 -> {label} "
+                    f"{selection['chosen'].version}#{rule.rule_id} "
+                    f"(hash={selection['chosen'].content_hash[:12]})"
+                ),
+            ))
+        else:
+            deriv.append(DerivationStep(
+                step="match_rule",
+                detail=(
+                    f"候选 {len(selection['entries'])} 条，无唯一适用规则"
+                    f"（{match_status}）；不计算截止时刻、不形成合规结论"
+                ),
+            ))
 
         hist = self.collect_history(sid, item)
         deriv.append(DerivationStep(
@@ -366,10 +625,25 @@ class _Engine:
             ),
         ))
 
-        if rule is None:
-            raw_viol.append(("item_rule_missing", sid, [item],
-                             f"样品 {sid} 的项目 {item} 没有对应时限规则", {}))
-            invalid = True
+        # 无/多候选/强制缺失：规则适用性违规（携带候选与字段来源），不产出截止时间
+        if rule is None and not (sid in self.inv_tainted and basis_time is None):
+            if match_status == "ambiguous":
+                msg = f"样品 {sid} 的项目 {item} 存在多个同等适用的规则，无法唯一确定限值"
+            elif match_status == "forced_missing":
+                msg = (f"样品 {sid} 的项目 {item} 试算强制指定的规则项 "
+                       f"{forced[2]} 不在候选池中")
+            else:
+                msg = f"样品 {sid} 的项目 {item} 没有满足生效区间与适用条件的规则"
+            raw_viol.append((
+                "rule_applicability", sid, [item], msg,
+                {
+                    "match_status": match_status,
+                    "candidate_count": len(selection["entries"]),
+                    "candidates": [c.model_dump(mode="json") for c in selection["views"]],
+                    "field_sources": [fs.model_dump(mode="json")
+                                      for fs in (sources or {}).values()],
+                },
+            ))
 
         if sid in self.inv_tainted:
             for rec in self._inversion_records(sid):
@@ -422,8 +696,15 @@ class _Engine:
 
         deadline_pre = deadline_ana = None
         pre_done = ana_done = None
+        missing_preservation = False
+        rule_source = (
+            f"rule:{selection['chosen'].version}#{rule.rule_id}(item={item})"
+            if rule is not None else f"unmatched#item={item}({match_status})"
+        )
 
-        if rule is not None and basis_time is not None:
+        # 仅唯一/强制匹配的规则参与截止时刻计算；display_basis 只用于展示
+        rule_selected = rule is not None and basis_tuple is not None
+        if rule_selected:
             if rule.pretreatment_minutes is not None:
                 deadline_pre = basis_time + timedelta(
                     minutes=rule.pretreatment_minutes)
@@ -452,14 +733,34 @@ class _Engine:
             if ana_events:
                 ana_done = ana_events[-1].time
 
-            # 防腐动作（同样只计已发生的）
+            # 防腐动作（同样只计已发生的）；动作来源样品随违规返回
             have = {a.name for a in hist["preservation"] if a.time <= req.eval_time}
             missing = [p for p in rule.required_preservation if p not in have]
             if missing:
+                missing_preservation = True
                 raw_viol.append((
                     "missing_preservation", sid, [item],
-                    f"样品 {sid} 的项目 {item} 缺少防腐动作 {missing}",
-                    {"required": rule.required_preservation, "performed": sorted(have)},
+                    f"样品 {sid} 的项目 {item} 保存动作不足：缺少 {missing}",
+                    {
+                        "required": rule.required_preservation,
+                        "performed": sorted(have),
+                        "performed_sources": [
+                            {"name": name, "records": recs}
+                            for name, recs in sorted(hist["pres_sources"].items())
+                            if any(
+                                datetime.fromisoformat(r["time"]) <= req.eval_time
+                                for r in recs
+                            )
+                        ],
+                        "field_sources": [
+                            {"field": "preservation",
+                             "source_sample_id": n["sample_id"],
+                             "source_field": "preservation",
+                             "value": name}
+                            for name, recs in sorted(hist["pres_sources"].items())
+                            for n in recs
+                        ],
+                    },
                 ))
 
             # 交接晚于截止时刻（未来交接不参与）
@@ -484,36 +785,33 @@ class _Engine:
                     ))
 
         phases: list[PhaseInfo] = []
-        if rule is not None:
+        if rule_selected:
             phases.append(self._phase(
-                "pretreatment", basis_time or s.sampling_start,
+                "pretreatment", basis_time,
                 rule.pretreatment_minutes, pre_done, req.eval_time,
                 req.critical_within_minutes, rule_source,
-                invalid or basis_time is None,
+                sid in self.inv_tainted,
             ))
             phases.append(self._phase(
-                "analysis", basis_time or s.sampling_start,
+                "analysis", basis_time,
                 rule.analysis_minutes, ana_done, req.eval_time,
                 req.critical_within_minutes, rule_source,
-                invalid or basis_time is None,
+                sid in self.inv_tainted,
             ))
-            # 基准不可解析（成环/断档）时温度检查仍要做：回退到该样品采样窗口
-            temp_basis = basis_time or s.sampling_start
             self._temperature_checks(
-                sid, item, rule, hist["temperature"], temp_basis,
+                sid, item, rule, hist["temperature"], basis_time,
                 req.eval_time, raw_viol,
             )
-        else:
-            phases.append(self._phase(
-                "analysis", s.sampling_start, None, ana_done, req.eval_time,
-                req.critical_within_minutes, rule_source, True,
-            ))
 
         # 时钟汇总状态
-        if invalid or basis_time is None or rule is None:
+        if structural_invalid or basis_tuple is None and basis_time is None:
             status = ClockStatus.INVALID
+        elif not rule_selected:
+            status = ClockStatus.INDETERMINATE  # none / ambiguous / forced_missing
         elif any(p.status == PhaseStatus.OVERDUE for p in phases):
             status = ClockStatus.OVERDUE
+        elif missing_preservation:
+            status = ClockStatus.INDETERMINATE  # 保存动作不足：保留期限信息但不下结论
         elif ana_done is not None and all(
             p.status == PhaseStatus.COMPLETED
             for p in phases
@@ -538,10 +836,33 @@ class _Engine:
             if next_deadline is not None else None
         )
         item_violations = [v for v in raw_viol if v[2] == [item]]
+
+        # 能否形成合规结论：结构失效 / 无唯一匹配 / 试算强制 / 保存动作不足 -> 否
+        conclusive = (
+            rule_selected
+            and match_status == "unique"
+            and not missing_preservation
+            and not structural_invalid
+        )
         conforming = (
-            status not in (ClockStatus.INVALID, ClockStatus.OVERDUE)
+            conclusive
+            and status not in (ClockStatus.OVERDUE,)
             and not item_violations
         )
+
+        matched_ref = None
+        if rule is not None and selection["chosen"] is not None:
+            matched_ref = ClockRuleRef(
+                version=selection["chosen"].version,
+                content_hash=selection["chosen"].content_hash,
+                rule_id=rule.rule_id, item=item,
+            )
+        match_context = None
+        if sources is not None:
+            match_context = MatchContext(
+                basis_time=basis_time or s.sampling_start,
+                field_sources=list(sources.values()),
+            )
 
         clock = ClockResult(
             sample_id=sid, item=item,
@@ -549,12 +870,17 @@ class _Engine:
             basis=basis_kind or "sampling_end",
             basis_time=basis_time or s.sampling_start,
             merged_at=merged_at,
-            status=status, conforming=conforming, phases=phases,
+            status=status, conforming=conforming, conclusive=conclusive,
+            phases=phases,
             next_action_deadline=next_deadline,
             next_action=next_action,
             remaining_minutes=remaining,
             latest_operation_at=deadline_ana,
-            rule_source=rule_source if rule else f"missing#item={item}",
+            rule_source=rule_source,
+            matched_rule=matched_ref,
+            match_status=match_status,
+            candidates=selection["views"],
+            match_context=match_context,
             derivation=deriv,
         )
         return clock, raw_viol
@@ -658,8 +984,8 @@ class _Break(Exception):
 def evaluate(
     *,
     request: JudgmentRequest,
-    rule_set: RuleSet,
-    content_hash: str,
+    pool: list[PoolEntry],
+    rule_sets: dict[str, RuleSet],
     package_id: str,
     version_no: int,
     trial: bool,
@@ -668,7 +994,7 @@ def evaluate(
     changes: Optional[list[StatusChange]] = None,
     sample_id: Optional[str] = None,
 ) -> JudgmentResult:
-    eng = _Engine(request, rule_set)
+    eng = _Engine(request, pool)
     clocks: list[ClockResult] = []
     raw: list[tuple] = []
     for s in request.samples:
@@ -715,11 +1041,11 @@ def evaluate(
         ))
     violations.sort(key=lambda v: (v.sample_id, v.code))
 
-    # 应优先收样的批次：仍有待办阶段的时钟，按截止时刻升序，按样品合并
+    # 应优先收样的批次：仍有待办阶段且可形成结论的时钟，按截止时刻升序合并
     pending = [
         c for c in clocks
         if c.status in (ClockStatus.OVERDUE, ClockStatus.CRITICAL, ClockStatus.OK)
-        and c.next_action_deadline is not None
+        and c.next_action_deadline is not None and c.conclusive
     ]
     by_sample: dict[str, list[ClockResult]] = {}
     for c in pending:
@@ -747,12 +1073,62 @@ def evaluate(
         "conforming": sum(1 for c in clocks if c.conforming),
         "overdue": sum(1 for c in clocks if c.status == ClockStatus.OVERDUE),
         "critical": sum(1 for c in clocks if c.status == ClockStatus.CRITICAL),
+        "indeterminate": sum(
+            1 for c in clocks if c.status == ClockStatus.INDETERMINATE
+        ),
+        "non_conclusive": sum(1 for c in clocks if not c.conclusive),
         "invalid": sum(1 for c in clocks if c.status == ClockStatus.INVALID),
         "violations": len(violations),
         "priority_batch_count": len(priority),
     }
 
-    version_tag = rule_set.version
+    # 各时钟冻结的规则集（按 content_hash 去重，保持稳定顺序）
+    frozen_hashes: list[str] = []
+    for c in clocks:
+        if c.matched_rule and c.matched_rule.content_hash not in frozen_hashes:
+            frozen_hashes.append(c.matched_rule.content_hash)
+    rules_ref: list[RuleRef] = []
+    for h in frozen_hashes:
+        rs = rule_sets.get(h)
+        rules_ref.append(RuleRef(
+            version=rs.version if rs else next(
+                (c.matched_rule.version for c in clocks
+                 if c.matched_rule and c.matched_rule.content_hash == h), ""),
+            content_hash=h,
+            name=rs.name if rs else "environmental-deadline-rules",
+            item_count=len(rs.items) if rs else 0,
+        ))
+    representative = rules_ref[0] if rules_ref else RuleRef(
+        version="(unmatched)", content_hash="-",
+        name="environmental-deadline-rules", item_count=0,
+    )
+
+    per_clock_basis = {
+        f"{c.sample_id}/{c.item}": {
+            "matched": None if c.matched_rule is None
+            else {
+                "version": c.matched_rule.version,
+                "rule_id": c.matched_rule.rule_id,
+                "content_hash": c.matched_rule.content_hash,
+            },
+            "match_status": c.match_status,
+        }
+        for c in clocks
+    }
+    matching_policy = {
+        "effective_interval": "half-open [effective_from, effective_to)",
+        "dimensions": ["matrix", "method", "container", "storage_condition"],
+        "dimension_wildcard": "空列表表示该维度通配",
+        "basis_time": "沿来源链解析的原始采样时刻（合样取最早组成样）",
+        "method_source": "sample.item_methods[item]",
+        "condition_source": "本样品优先；未提交时沿来源链回退到祖先样品",
+        "forced_selection": bool(request.selected_candidates),
+    }
+    basis_policy = {
+        "continuous_default": ContinuousBasis.END.value,
+        "per_clock": per_clock_basis,
+    }
+
     return JudgmentResult(
         package_id=package_id,
         sample_id=sample_id,
@@ -761,16 +1137,10 @@ def evaluate(
         request_id=request.request_id,
         eval_time=request.eval_time,
         created_at=created_at,
-        rule=RuleRef(
-            version=version_tag, content_hash=content_hash,
-            name=rule_set.name, item_count=len(rule_set.items),
-        ),
-        basis_policy={
-            "continuous_default": ContinuousBasis.END.value,
-            "per_item": {
-                r.item: r.continuous_basis.value for r in rule_set.items
-            },
-        },
+        rule=representative,
+        rules=rules_ref,
+        selection_policy=matching_policy,
+        basis_policy=basis_policy,
         summary=summary,
         clocks=clocks,
         violations=violations,

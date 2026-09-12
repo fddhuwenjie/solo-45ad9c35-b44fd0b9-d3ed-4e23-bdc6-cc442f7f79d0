@@ -82,6 +82,10 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
         );
         """
     )
+    # 旧库迁移：包内可能冻结多个规则集版本（各时钟唯一匹配），rule_hash 退化为代表
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(judgments)").fetchall()}
+    if "rule_hashes_json" not in cols:
+        conn.execute("ALTER TABLE judgments ADD COLUMN rule_hashes_json TEXT")
     conn.commit()
 
 
@@ -172,6 +176,27 @@ def list_rule_sets() -> list[dict]:
     return out
 
 
+def all_rule_sets_payload() -> list[tuple[str, RuleSet]]:
+    """全部已登记规则集（含内容），用于构建适用性候选池。"""
+    rows = get_conn().execute(
+        "SELECT content_hash, payload_json FROM rule_sets ORDER BY created_at"
+    ).fetchall()
+    return [
+        (r["content_hash"], RuleSet.model_validate(json.loads(r["payload_json"])))
+        for r in rows
+    ]
+
+
+def all_formal_requests() -> list[dict]:
+    """全部正式接收（非试算）且带请求快照的判定记录，供影响预览重放。"""
+    rows = get_conn().execute(
+        "SELECT package_id, sample_id, scope, request_json, package_json"
+        " FROM judgments WHERE trial = 0 AND request_json IS NOT NULL"
+        " ORDER BY created_at"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------- 判定 ----
 
 def _register_sample_versions(conn, package: JudgmentResult) -> None:
@@ -206,16 +231,19 @@ def save_judgment(
             if row:
                 return JudgmentResult.model_validate(json.loads(row["package_json"]))
         try:
+            hashes = sorted({c.matched_rule.content_hash
+                             for c in package.clocks if c.matched_rule})
             conn.execute(
                 "INSERT INTO judgments(package_id, sample_id, scope, version_no, trial,"
-                " request_id, idempotency_key, rule_hash, eval_time, package_json,"
-                " request_json, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " request_id, idempotency_key, rule_hash, rule_hashes_json, eval_time,"
+                " package_json, request_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     package.package_id, package.sample_id,
                     "sample" if package.sample_id else "batch",
                     package.version_no, int(trial), package.request_id,
                     idempotency_key, package.rule.content_hash,
+                    canonical_json(hashes),
                     package.eval_time.isoformat(), payload, request_json,
                     package.created_at.isoformat(),
                 ),

@@ -40,13 +40,16 @@ RULES_V1 = {
     "items": [
         {"item": "cod", "item_name": "化学需氧量", "min_temp_c": 0, "max_temp_c": 4,
          "pretreatment_minutes": 120, "analysis_minutes": 1440,
-         "required_preservation": ["cool_4c"], "continuous_basis": "end"},
+         "required_preservation": ["cool_4c"], "continuous_basis": "end",
+         "effective_to": "2027-01-01T00:00:00+08:00"},
         {"item": "oil", "item_name": "石油类", "min_temp_c": 0, "max_temp_c": 4,
          "pretreatment_minutes": None, "analysis_minutes": 600,
-         "required_preservation": ["cool_4c", "dark"], "continuous_basis": "end"},
+         "required_preservation": ["cool_4c", "dark"], "continuous_basis": "end",
+         "effective_to": "2027-01-01T00:00:00+08:00"},
         {"item": "nh3n", "item_name": "氨氮", "min_temp_c": 0, "max_temp_c": 4,
          "pretreatment_minutes": 240, "analysis_minutes": 1440,
-         "required_preservation": ["add_acid"], "continuous_basis": "end"},
+         "required_preservation": ["add_acid"], "continuous_basis": "end",
+         "effective_to": "2027-01-01T00:00:00+08:00"},
     ],
 }
 
@@ -150,18 +153,34 @@ def main() -> None:
         r = c.post("/api/v1/judgments/trial", json=envelope(60, [a, b]))
         show("④ 试算·来源成环 + 温度越界", r.json())
 
-        # 5) 规则更新：新版本号 v2（cod 分析期限放宽到 2880），旧包不变
-        rules_v2 = json.loads(json.dumps(RULES_V1))
-        rules_v2["version"] = "HJ-2026.2"
-        rules_v2["items"][0]["analysis_minutes"] = 2880
-        r_new = c.post("/api/v1/rules", json=rules_v2)
-        print("\n⑤ 新规则登记:", r_new.json())
+        # 5) 规则更新与适用范围冲突预检
+        # 5a) 同适用范围、同生效区间改限值 -> 409（会导致同一时钟多同等候选）
+        rules_v2_overlap = json.loads(json.dumps(RULES_V1))
+        rules_v2_overlap["version"] = "HJ-2026.2"
+        rules_v2_overlap["items"][0]["analysis_minutes"] = 2880
+        r_overlap = c.post("/api/v1/rules", json=rules_v2_overlap)
+        print("\n⑤a 同适用范围改限值登记 ->", r_overlap.status_code,
+              "（", len(r_overlap.json()["detail"]["conflicts"]), "条适用范围冲突）")
 
-        # 旧可读版本号绑定不同内容 -> 409
-        clash = json.loads(json.dumps(rules_v2))
+        # 5b) dry_run 预检（不写库）
+        dr = c.post("/api/v1/rules?dry_run=true", json=rules_v2_overlap).json()
+        print("⑤b dry_run 预检: would_register =", dr["would_register"],
+              "conflict_count =", dr["conflict_count"])
+
+        # 5c) 旧版本号绑定不同内容 -> 409
+        clash = json.loads(json.dumps(rules_v2_overlap))
         clash["version"] = "HJ-2026.1"
         r_clash = c.post("/api/v1/rules", json=clash)
-        print("复用旧版本号提交不同内容 ->", r_clash.status_code, r_clash.json()["detail"])
+        print("⑤c 复用旧版本号提交不同内容 ->", r_clash.status_code)
+
+        # 5d) 合法演进：v2 错峰生效（2027-01-01 起），与在库规则不重叠
+        successor = "2027-01-01T00:00:00+08:00"
+        rules_v2 = json.loads(json.dumps(rules_v2_overlap))
+        for it in rules_v2["items"]:
+            it["effective_from"] = successor
+            it["effective_to"] = None  # 新标准向后无界
+        r_new = c.post("/api/v1/rules", json=rules_v2)
+        print("⑤d 错峰生效新版本登记 ->", r_new.status_code, r_new.json().get("created"))
 
         # 6) 补录：oil 在 500 分钟完成分析，温度补齐，eval=550
         supp = {

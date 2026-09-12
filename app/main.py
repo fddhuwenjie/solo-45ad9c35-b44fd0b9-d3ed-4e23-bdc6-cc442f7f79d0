@@ -151,14 +151,21 @@ def get_rule(version: str):
 
 
 @app.post("/api/v1/rules", tags=["rules"], status_code=201)
-def register_rules(rule_set: RuleSet) -> dict:
-    h, created = db.register_rule_set(rule_set)
-    return {
-        "version": rule_set.version,
-        "content_hash": h,
-        "created": created,
-        "note": "内容已存在" if not created else "已登记（旧版本判定永不受影响）",
-    }
+def register_rules(rule_set: RuleSet, dry_run: bool = False) -> dict:
+    """登记规则版本。
+
+    * ``dry_run=true``：只预检适用范围冲突（不写库，返回 200 与冲突清单）；
+    * 与已登记规则在同一项目的重叠生效区间内可同时命中 -> 409 并列明细。
+    """
+    result = service.register_rule_set(rule_set, dry_run=dry_run)
+    return result
+
+
+@app.post("/api/v1/rules/impact-preview", tags=["rules"])
+def rules_impact_preview(rule_set: RuleSet) -> dict:
+    """影响预览：把携带的规则集并入候选池，用全部已保存的正式请求试算，
+    列出会改选（或失去）规则的样品—项目；不登记规则、不改写旧判定。"""
+    return service.impact_preview(rule_set)
 
 
 @app.post("/api/v1/rules/diff", tags=["rules"])

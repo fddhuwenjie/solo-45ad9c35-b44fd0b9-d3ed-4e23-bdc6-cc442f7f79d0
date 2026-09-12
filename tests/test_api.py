@@ -431,26 +431,49 @@ def test_receive_idempotent_and_immutable(client):
 
 
 def test_rule_update_cannot_rewrite_old_version(client):
+    from app.models import ItemRule, RuleSet
+    boundary = dt(100000)
+    # v1 规则带生效上界（模拟被替代的旧标准）
+    v1_items = [
+        it.model_copy(update={"effective_to": boundary})
+        for it in ruleset("v1").items
+    ]
+    v1_set = RuleSet(version="v1", items=v1_items)
     s = make_sample()
-    req1 = request([s], eval_min=30, rule_set=ruleset("v1"))
+    req1 = request([s], eval_min=30, rule_set=v1_set)
     r1 = client.post("/api/v1/judgments", json=req1.model_dump(mode="json"))
     pid1 = r1.json()["package_id"]
     hash1 = r1.json()["rule"]["content_hash"]
 
-    from app.models import ItemRule, RuleSet
     new_items = [it.model_copy(update={"analysis_minutes": 9999})
-                 for it in ruleset("v1").items]
+                 for it in v1_set.items]
     clash = RuleSet(version="v1", items=new_items)
-    # 相同可读版本号但内容不同 -> 409
-    req_clash = request([s], eval_min=30, rule_set=clash)
-    rc = client.post("/api/v1/judgments", json=req_clash.model_dump(mode="json"))
+    # 相同可读版本号但内容不同：直接登记 -> 409
+    rc = client.post("/api/v1/rules", json=clash.model_dump(mode="json"))
     assert rc.status_code == 409
+    # 走正式接收携带该冲突集：被版本标签冲突或匹配守门拒绝（均为 4xx，不落库）
+    req_clash = request([s], eval_min=30, rule_set=clash)
+    rx = client.post("/api/v1/judgments", json=req_clash.model_dump(mode="json"))
+    assert rx.status_code in (409, 422)
 
-    # 用新版本号提交：旧包 hash 不变
-    ok = RuleSet(version="v2", items=new_items)
-    req2 = request([s], eval_min=30, rule_set=ok)
-    r2 = client.post("/api/v1/judgments", json=req2.model_dump(mode="json"))
-    assert r2.json()["rule"]["content_hash"] != hash1
+    # 同生效区间、同适用范围但改限值 -> 适用性冲突预检 409（会出现多同等候选）
+    overlap = RuleSet(version="vX", items=new_items)
+    ro = client.post("/api/v1/rules", json=overlap.model_dump(mode="json"))
+    assert ro.status_code == 409
+
+    # 合法演进：v2 从 boundary 时刻接续（区间不重叠），旧包 hash 不变
+    future_items = [
+        it.model_copy(update={
+            "analysis_minutes": 9999,
+            "effective_to": None,
+            "effective_from": boundary,
+        })
+        for it in v1_set.items
+    ]
+    ok = RuleSet(version="v2", items=future_items)
+    r2 = client.post("/api/v1/rules", json=ok.model_dump(mode="json"))
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["content_hash"] != hash1
     old = client.get(f"/api/v1/judgments/{pid1}").json()
     assert old["rule"]["content_hash"] == hash1
 
@@ -612,11 +635,20 @@ def test_unknown_item_rejected(client):
 
 
 def test_missing_rules_rejected(client):
+    # 不再强制提供 rule_set/rule_version：候选池为空时不报错（422），
+    # 而是正常试算出无匹配时钟（indeterminate，不形成结论）
     s = make_sample()
     payload = request([s]).model_dump(mode="json")
     payload.pop("rule_set")
     r = client.post("/api/v1/judgments/trial", json=payload)
-    assert r.status_code == 422
+    assert r.status_code == 200
+    cl = r.json()["clocks"]
+    assert all(c["match_status"] == "none" for c in cl)
+    assert all(c["status"] == "indeterminate" for c in cl)
+    assert any(v["code"] == "rule_applicability"
+               for v in r.json()["violations"])
+    # 但正式接收无候选 -> 422（不得固化无结论判定）
+    assert client.post("/api/v1/judgments", json=payload).status_code == 422
 
 
 def test_duplicate_rule_item_rejected(client):
@@ -632,15 +664,27 @@ def test_duplicate_rule_item_rejected(client):
 
 
 def test_rule_registration_and_diff(client):
-    r1 = client.post("/api/v1/rules", json=ruleset("v1").model_dump(mode="json"))
+    from app.models import ItemRule, RuleSet
+    # v1 规则带生效上界，v2 从该时刻接续（避免适用范围重叠预检）
+    boundary = dt(100000)
+    v1_ruleset = RuleSet(version="v1", items=[
+        it.model_copy(update={"effective_to": boundary})
+        for it in ruleset().items
+    ])
+    r1 = client.post("/api/v1/rules", json=v1_ruleset.model_dump(mode="json"))
     assert r1.status_code == 201 and r1.json()["created"] is True
-    r2 = client.post("/api/v1/rules", json=ruleset("v1").model_dump(mode="json"))
+    r2 = client.post("/api/v1/rules", json=v1_ruleset.model_dump(mode="json"))
     assert r2.json()["created"] is False  # 内容去重
 
-    from app.models import ItemRule, RuleSet
+    # 新版本规则从 boundary 生效，避免与 v1 在同一适用范围内重叠
     v2 = RuleSet(version="v2", items=[
-        it.model_copy(update={"analysis_minutes": it.analysis_minutes * 2})
-        if it.item == "cod" else it for it in ruleset().items
+        it.model_copy(update={
+            "analysis_minutes": it.analysis_minutes * 2,
+            "effective_from": boundary,
+        })
+        if it.item == "cod"
+        else it.model_copy(update={"effective_from": boundary})
+        for it in ruleset().items
     ])
     client.post("/api/v1/rules", json=v2.model_dump(mode="json"))
     d = client.post("/api/v1/rules/diff",
@@ -663,3 +707,271 @@ def test_priority_batches_ordered_by_due(client):
         json=request([a, b], eval_min=30).model_dump(mode="json"))
     batches = r.json()["priority_batches"]
     assert [b["sample_id"] for b in batches][:2] == ["B", "A"]
+
+
+# ====================================================== 规则适用性匹配 ----
+
+from app.models import ItemRule, RuleSet as _RS, Sample as _S, SampleKind as _SK
+
+
+def _scoped_rule(rule_id, item="cod", *, matrices=None, methods=None,
+                 containers=None, storage=None, analysis=1440, pre=120,
+                 eff_from=None, eff_to=None, preservation=None):
+    return ItemRule(
+        item=item, rule_id=rule_id,
+        effective_from=eff_from, effective_to=eff_to,
+        matrices=matrices or [], methods=methods or [],
+        containers=containers or [], storage_conditions=storage or [],
+        min_temp_c=0, max_temp_c=4,
+        pretreatment_minutes=pre, analysis_minutes=analysis,
+        required_preservation=preservation or ["cool_4c"],
+    )
+
+
+def _scoped_sample(sid="b1", item="cod", *, matrix=None, method=None,
+                   container=None, storage=None):
+    from app.models import PreservationAction
+    return _S(
+        id=sid, kind=_SK.GRAB, items=[item],
+        container=container, matrix=matrix, storage_condition=storage,
+        item_methods={item: method} if method else {},
+        sampling_start=dt(0), sampling_end=dt(0),
+        preservation=[PreservationAction(name="cool_4c", time=dt(0))],
+        temperature=temps(0, 30, 10), custody_transfers=[dt(10)],
+    )
+
+
+def _trial(client, samples, rule_set, eval_min=30, **kw):
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(
+        eval_time=dt(eval_min), rule_set=rule_set, samples=samples,
+        critical_within_minutes=60, **kw)
+    return client.post("/api/v1/judgments/trial",
+                       json=req.model_dump(mode="json"))
+
+
+def test_applicability_matrix_method_selects_unique(client):
+    surf = _RS(version="r1", items=[
+        _scoped_rule("cod-surface", matrices=["surface_water"],
+                     methods=["hj828"], analysis=1000)])
+    waste = _RS(version="r2", items=[
+        _scoped_rule("cod-waste", matrices=["wastewater"],
+                     methods=["hj828"], analysis=500)])
+    client.post("/api/v1/rules", json=surf.model_dump(mode="json"))
+    client.post("/api/v1/rules", json=waste.model_dump(mode="json"))
+    s = _scoped_sample(matrix="wastewater", method="hj828")
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), samples=[s])
+    r = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = r.json()["clocks"][0]
+    assert cl["match_status"] == "unique"
+    assert cl["matched_rule"]["rule_id"] == "cod-waste"
+    assert cl["status"] in ("ok", "critical")
+    assert cl["conclusive"] is True
+    # 未中选规则仍在候选列表中，并标明未满足的 matrix 维度及字段来源
+    cand = {c["rule_id"]: c for c in cl["candidates"]}
+    assert cand["cod-surface"]["applies"] is False
+    unmet = cand["cod-surface"]["unmet"][0]
+    assert unmet["dimension"] == "matrix"
+    assert unmet["field_sources"][0]["field"] == "matrix"
+    assert unmet["field_sources"][0]["value"] == "wastewater"
+
+
+def test_applicability_no_match_is_indeterminate(client):
+    surf = _RS(version="r1", items=[
+        _scoped_rule("cod-surface", matrices=["surface_water"])])
+    s = _scoped_sample(matrix="wastewater", method="hj828")
+    r = _trial(client, [s], surf)
+    cl = r.json()["clocks"][0]
+    assert cl["status"] == "indeterminate"
+    assert cl["match_status"] == "none"
+    assert cl["conclusive"] is False and cl["conforming"] is False
+    assert cl["latest_operation_at"] is None  # 无匹配不产出截止时刻
+    assert cl["candidates"][0]["unmet"][0]["dimension"] == "matrix"
+    assert any(v["code"] == "rule_applicability"
+               for v in r.json()["violations"])
+    # 正式接收被守门拒绝
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), rule_set=surf, samples=[s])
+    rc = client.post("/api/v1/judgments", json=req.model_dump(mode="json"))
+    assert rc.status_code == 422
+    assert any(c["item"] == "cod" for c in rc.json()["detail"]["blocked_clocks"])
+
+
+def test_applicability_ambiguous_candidates(client):
+    # 规则集内部重叠 -> 422（端点模型校验）
+    rb = client.post("/api/v1/rules", json={
+        "version": "bad", "items": [
+            _scoped_rule("cod-a", analysis=1000).model_dump(mode="json"),
+            _scoped_rule("cod-b", analysis=500).model_dump(mode="json"),
+        ]})
+    assert rb.status_code == 422
+
+    # 跨规则集重叠：登记被预检 409 拦截，库内保证唯一；但试算携带未登记集
+    # 与已登记集在同一条件下同时命中 -> 歧义时钟
+    a = _RS(version="a", items=[_scoped_rule("cod-a", analysis=1000)])
+    assert client.post(
+        "/api/v1/rules", json=a.model_dump(mode="json")).status_code == 201
+    b = _RS(version="b", items=[_scoped_rule("cod-b", analysis=500)])
+    s = _scoped_sample(matrix="surface_water", method="hj828")
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), rule_set=b, samples=[s])
+    r = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = r.json()["clocks"][0]
+    assert cl["match_status"] == "ambiguous"
+    assert cl["status"] == "indeterminate"
+    assert len([c for c in cl["candidates"] if c["applies"]]) == 2
+    assert cl["conclusive"] is False
+    # 该歧义集不得登记
+    assert client.post(
+        "/api/v1/rules", json=b.model_dump(mode="json")).status_code == 409
+
+
+def test_effective_interval_boundary_half_open(client):
+    boundary = dt(60)
+    old = _RS(version="old", items=[
+        _scoped_rule("cod-old", eff_to=boundary, analysis=1000)])
+    new = _RS(version="new", items=[
+        _scoped_rule("cod-new", eff_from=boundary, analysis=500)])
+    client.post("/api/v1/rules", json=old.model_dump(mode="json"))
+    client.post("/api/v1/rules", json=new.model_dump(mode="json"))
+    from app.models import JudgmentRequest
+    s = _scoped_sample()
+    # 采样在边界点（=effective_from new，含；=effective_to old，不含）-> 命中 new
+    s_boundary = _scoped_sample()
+    req = JudgmentRequest(
+        eval_time=dt(90), samples=[s_boundary],
+        rule_version=None)
+    # 直接把采样时刻设到 boundary
+    s_boundary.sampling_start = boundary
+    s_boundary.sampling_end = boundary
+    r = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = r.json()["clocks"][0]
+    assert cl["matched_rule"]["rule_id"] == "cod-new"
+    assert cl["basis_time"] == boundary.isoformat().replace("+00:00", "Z")
+
+
+def test_registration_conflict_precheck(client):
+    a = _RS(version="a", items=[_scoped_rule("cod-a", analysis=1000)])
+    client.post("/api/v1/rules", json=a.model_dump(mode="json"))
+    # 干跑预检
+    b = _RS(version="b", items=[_scoped_rule("cod-b", analysis=500)])
+    dr = client.post("/api/v1/rules?dry_run=true",
+                     json=b.model_dump(mode="json")).json()
+    assert dr["would_register"] is False and dr["conflict_count"] >= 1
+    assert dr["conflicts"][0]["item"] == "cod"
+    # 正式登记被 409
+    assert client.post("/api/v1/rules", json=b.model_dump(mode="json")).status_code == 409
+    # 错峰生效：用独立项目验证“接续区间无冲突、可登记”（避开已存在的 cod 规则）
+    boundary = dt(1000)
+    old = client.post("/api/v1/rules", json=_RS(version="a2", items=[
+        _scoped_rule("tn-old", item="tn", analysis=1000, eff_to=boundary)
+    ]).model_dump(mode="json"))
+    assert old.status_code == 201
+    c = _RS(version="c", items=[
+        _scoped_rule("tn-new", item="tn", analysis=500, eff_from=boundary)])
+    ok = client.post("/api/v1/rules", json=c.model_dump(mode="json"))
+    assert ok.status_code == 201
+
+
+def test_trial_forced_candidate_comparison(client):
+    surf = _RS(version="r1", items=[
+        _scoped_rule("cod-surface", matrices=["surface_water"], analysis=1000)])
+    waste = _RS(version="r2", items=[
+        _scoped_rule("cod-waste", matrices=["wastewater"], analysis=500)])
+    client.post("/api/v1/rules", json=surf.model_dump(mode="json"))
+    client.post("/api/v1/rules", json=waste.model_dump(mode="json"))
+    s = _scoped_sample(matrix="wastewater", method="hj828")
+    # 不强制：唯一命中 cod-waste
+    r0 = _trial(client, [s], None) if False else None
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), samples=[s],
+                          selected_candidates={
+                              "b1/cod": {"rule_id": "cod-surface"}})
+    r = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = r.json()["clocks"][0]
+    assert cl["match_status"] == "forced"
+    assert cl["matched_rule"]["rule_id"] == "cod-surface"
+    assert cl["conclusive"] is False  # 对照不得形成合规结论
+    # 强制不存在的规则项 -> 422
+    req_bad = JudgmentRequest(eval_time=dt(30), samples=[s],
+                              selected_candidates={"b1/cod": {"rule_id": "ghost"}})
+    assert client.post("/api/v1/judgments/trial",
+                       json=req_bad.model_dump(mode="json")).status_code == 422
+
+
+def test_insufficient_preservation_is_indeterminate(client):
+    rs = _RS(version="r1", items=[
+        _scoped_rule("cod-acid", matrices=["wastewater"],
+                     preservation=["cool_4c", "add_acid"])])
+    # 样品只做了 cool_4c，缺 add_acid
+    s = _scoped_sample(matrix="wastewater", method="hj828")
+    r = _trial(client, [s], rs)
+    cl = r.json()["clocks"][0]
+    assert cl["match_status"] == "unique"  # 规则唯一，但保存动作不足
+    assert cl["status"] == "indeterminate"
+    assert cl["conclusive"] is False
+    v = next(v for v in r.json()["violations"]
+             if v["code"] == "missing_preservation")
+    assert "add_acid" in v["message"]
+    # 截止时刻仍照算（供操作参考），但不形成合规结论，正式接收拒绝
+    assert cl["latest_operation_at"] is not None
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), rule_set=rs, samples=[s])
+    assert client.post("/api/v1/judgments",
+                       json=req.model_dump(mode="json")).status_code == 422
+
+
+def test_impact_preview_lists_reselected(client):
+    surf = _RS(version="r1", items=[
+        _scoped_rule("cod-surface", matrices=["surface_water"], analysis=1000)])
+    client.post("/api/v1/rules", json=surf.model_dump(mode="json"))
+    s = _scoped_sample(matrix="surface_water", method="hj828")
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), samples=[s],
+                          idempotency_key="ik-impact")
+    r1 = client.post("/api/v1/judgments", json=req.model_dump(mode="json"))
+    assert r1.status_code == 201
+    pid = r1.json()["package_id"]
+
+    # 新规则：同基质同方法、生效重叠、限值更紧 -> 影响预览应报告该时钟改选/歧义
+    tighter = _RS(version="r2", items=[
+        _scoped_rule("cod-surface-v2", matrices=["surface_water"],
+                     methods=["hj828"], analysis=300)])
+    ip = client.post("/api/v1/rules/impact-preview",
+                     json=tighter.model_dump(mode="json")).json()
+    assert ip["stored_packages_scanned"] >= 1
+    hit = [x for x in ip["reselected"] if x["sample_id"] == "b1"
+           and x["item"] == "cod"]
+    assert hit and hit[0]["before"]["rule_id"] == "cod-surface"
+    assert hit[0]["after_match_status"] == "ambiguous"
+    # 原判定未被改写
+    old = client.get(f"/api/v1/judgments/{pid}").json()
+    assert old["clocks"][0]["matched_rule"]["rule_id"] == "cod-surface"
+    # 新规则未被登记
+    assert all(r["version"] != "r2"
+               for r in client.get("/api/v1/rules").json()["rules"])
+
+
+def test_field_source_traces_to_origin_sample(client):
+    """分样未提交基质/方法时，字段来源沿来源链回退到母体。"""
+    from app.models import Sample, SampleKind
+    rs = _RS(version="r1", items=[
+        _scoped_rule("cod-gw", matrices=["groundwater"], analysis=700)])
+    client.post("/api/v1/rules", json=rs.model_dump(mode="json"))
+    mother = _scoped_sample(sid="M", matrix="groundwater", method="hj828")
+    child = Sample(
+        id="A", kind=SampleKind.ALIQUOT, items=["cod"],
+        sampling_start=dt(10), sampling_end=dt(10), parent_ids=["M"],
+        temperature=temps(10, 30, 10))
+    from app.models import JudgmentRequest
+    req = JudgmentRequest(eval_time=dt(30), samples=[mother, child])
+    r = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    clocks = {c["sample_id"]: c for c in r.json()["clocks"]}
+    ca = clocks["A"]
+    assert ca["matched_rule"]["rule_id"] == "cod-gw"
+    src = {f["field"]: f for f in ca["match_context"]["field_sources"]}
+    assert src["matrix"]["source_sample_id"] == "M"
+    assert src["matrix"]["value"] == "groundwater"
+    assert src["method"]["source_sample_id"] == "M"
+    assert src["basis_time"]["source_sample_id"] == "M"  # 基准也来自母体

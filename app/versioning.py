@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import timezone
 from typing import Any, Iterable
 
 from .models import RuleSet
@@ -16,13 +17,28 @@ def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
+def _iso(dt):
+    return None if dt is None else dt.astimezone(timezone.utc).isoformat()
+
+
 def rule_content(rule_set: RuleSet) -> dict:
-    """决定时限行为的内容（去掉 note 等不影响判定的字段）。"""
+    """决定时限行为的内容（去掉 note 等不影响判定的字段）。
+
+    适用范围（生效区间、基质/方法/容器/保存条件）与 rule_id 都是规则身份的
+    一部分：同样限值但适用条件不同的规则项哈希必然不同。
+    """
     return {
         "name": rule_set.name,
         "items": [
             {
                 "item": r.item,
+                "rule_id": r.rule_id,
+                "effective_from": _iso(r.effective_from),
+                "effective_to": _iso(r.effective_to),
+                "matrices": sorted(r.matrices),
+                "methods": sorted(r.methods),
+                "containers": sorted(r.containers),
+                "storage_conditions": sorted(r.storage_conditions),
                 "min_temp_c": r.min_temp_c,
                 "max_temp_c": r.max_temp_c,
                 "pretreatment_minutes": r.pretreatment_minutes,
@@ -30,7 +46,7 @@ def rule_content(rule_set: RuleSet) -> dict:
                 "required_preservation": sorted(r.required_preservation),
                 "continuous_basis": r.continuous_basis.value,
             }
-            for r in sorted(rule_set.items, key=lambda x: x.item)
+            for r in sorted(rule_set.items, key=lambda x: (x.item, x.rule_id))
         ],
     }
 
@@ -42,16 +58,23 @@ def hash_rules(rule_set: RuleSet) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _index_rules(rule_set: RuleSet) -> dict[str, dict]:
-    return {r.item: r.model_dump() for r in rule_set.items}
+def _index_rules(rule_set: RuleSet) -> dict[tuple[str, str], dict]:
+    return {(r.item, r.rule_id): r.model_dump(mode="json")
+            for r in rule_set.items}
 
 
 def diff_rule_sets(old: RuleSet, new: RuleSet) -> list[dict]:
-    """逐项目比较两套规则，返回可读的差异列表。"""
+    """逐规则项比较两套规则，返回可读的差异列表。"""
     changes: list[dict] = []
     old_idx = _index_rules(old)
     new_idx = _index_rules(new)
     fields = (
+        "effective_from",
+        "effective_to",
+        "matrices",
+        "methods",
+        "containers",
+        "storage_conditions",
         "min_temp_c",
         "max_temp_c",
         "pretreatment_minutes",
@@ -59,22 +82,26 @@ def diff_rule_sets(old: RuleSet, new: RuleSet) -> list[dict]:
         "required_preservation",
         "continuous_basis",
     )
-    for item in sorted(set(old_idx) | set(new_idx)):
-        if item not in old_idx:
-            changes.append({"item": item, "kind": "item_added", "new": new_idx[item]})
+    for key in sorted(set(old_idx) | set(new_idx)):
+        item, rule_id = key
+        if key not in old_idx:
+            changes.append({"item": item, "rule_id": rule_id,
+                            "kind": "item_added", "new": new_idx[key]})
             continue
-        if item not in new_idx:
-            changes.append({"item": item, "kind": "item_removed", "old": old_idx[item]})
+        if key not in new_idx:
+            changes.append({"item": item, "rule_id": rule_id,
+                            "kind": "item_removed", "old": old_idx[key]})
             continue
         for f in fields:
-            if old_idx[item].get(f) != new_idx[item].get(f):
+            if old_idx[key].get(f) != new_idx[key].get(f):
                 changes.append(
                     {
                         "item": item,
+                        "rule_id": rule_id,
                         "kind": "field_changed",
                         "field": f,
-                        "old": old_idx[item].get(f),
-                        "new": new_idx[item].get(f),
+                        "old": old_idx[key].get(f),
+                        "new": new_idx[key].get(f),
                     }
                 )
     return changes
@@ -82,16 +109,19 @@ def diff_rule_sets(old: RuleSet, new: RuleSet) -> list[dict]:
 
 def _clock_view(c: dict) -> tuple:
     """从判定包 dict 中抽取可比较的时钟状态视图。"""
+    mr = c.get("matched_rule")
     return (
         c["sample_id"],
         c["item"],
         c["status"],
+        c.get("conclusive"),
         c["conforming"],
         c["remaining_minutes"],
         None if c["next_action_deadline"] is None else c["next_action_deadline"],
         c["next_action"],
         None if c["latest_operation_at"] is None else c["latest_operation_at"],
         tuple((p["phase"], p["status"], p["remaining_minutes"]) for p in c["phases"]),
+        None if mr is None else (mr["content_hash"], mr["rule_id"]),
     )
 
 
@@ -141,6 +171,21 @@ def diff_judgments(old_pkg: dict, new_pkg: dict) -> list[dict]:
                         "after": str(new_v),
                     }
                 )
+        om = oc.get("matched_rule")
+        nm = nc.get("matched_rule")
+        om_id = None if om is None else (om["content_hash"], om["rule_id"])
+        nm_id = None if nm is None else (nm["content_hash"], nm["rule_id"])
+        if om_id != nm_id:
+            changes.append(
+                {
+                    "sample_id": sid,
+                    "item": item,
+                    "kind": "rule_reselected",
+                    "field": "matched_rule",
+                    "before": None if om is None else f"{om['version']}#{om['rule_id']}",
+                    "after": None if nm is None else f"{nm['version']}#{nm['rule_id']}",
+                }
+            )
 
     def vkey(v: dict) -> tuple:
         return (v["code"], v["sample_id"], tuple(sorted(v["items"])), v["message"])
