@@ -536,3 +536,218 @@ class JudgmentResult(BaseModel):
         None, description="补录时所基于的上一版本 package_id"
     )
     changes: list[StatusChange] = Field(default_factory=list)
+
+
+# ================================================================ 排程 ----
+
+class ResourceKind(str, Enum):
+    PRETREATMENT = "pretreatment"  # 前处理工位
+    INSTRUMENT = "instrument"      # 分析仪器
+
+
+class TimeWindow(BaseModel):
+    """半开时段 [start, end)：可用时段或停机窗。"""
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return as_utc(v)
+
+    @model_validator(mode="after")
+    def _order(self) -> "TimeWindow":
+        if self.end <= self.start:
+            raise ValueError("时段 end 必须晚于 start（半开区间）")
+        return self
+
+
+class ResourceConfig(BaseModel):
+    """一个前处理工位或仪器的排程配置。"""
+    resource_id: str
+    kind: ResourceKind
+    methods: list[str] = Field(
+        default_factory=list,
+        description="适用分析方法（对应样品 item_methods）；空列表=通配",
+    )
+    capacity: int = Field(1, ge=1, description="单批容量：同批最多任务数")
+    task_minutes: float = Field(
+        ..., gt=0, description="单批任务时长（分钟，整批占用该资源）"
+    )
+    switch_minutes: float = Field(
+        0, ge=0, description="相邻批次方法不同时所需的方法切换时间（分钟）"
+    )
+    windows: list[TimeWindow] = Field(..., description="可用时段")
+    downtime: list[TimeWindow] = Field(default_factory=list, description="停机窗")
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> "ResourceConfig":
+        if not self.resource_id:
+            raise ValueError("resource_id 不能为空")
+        if not self.windows:
+            raise ValueError(f"资源 {self.resource_id} 至少需要一个可用时段")
+        return self
+
+
+class ResourceSet(BaseModel):
+    """可版本化的资源配置集合。version 是可读版本号；
+    服务端按资源内容计算 content_hash 作为不可变身份。"""
+    version: str = Field(..., description="可读版本号，如 LAB-2026.1")
+    name: str = "lab-resource-profile"
+    resources: list[ResourceConfig]
+    note: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _unique(self) -> "ResourceSet":
+        if not self.resources:
+            raise ValueError("资源集至少包含一个资源")
+        ids = [r.resource_id for r in self.resources]
+        if len(ids) != len(set(ids)):
+            dup = sorted({x for x in ids if ids.count(x) > 1})
+            raise ValueError(f"资源集中 resource_id 不得重复: {dup}")
+        return self
+
+
+class ScheduleRequest(BaseModel):
+    request_id: Optional[str] = Field(None, description="调用方追踪号")
+    idempotency_key: Optional[str] = Field(
+        None, description="签发幂等键；相同键重复签发返回同一排程版本"
+    )
+    schedule_time: datetime = Field(
+        ..., description="排程基准时刻：任务不得安排在此刻之前，带时区"
+    )
+    package_ids: Optional[list[str]] = Field(
+        None,
+        description="参与排程的已冻结判定包；缺省=全部样品的最新正式判定",
+    )
+    resource_version: Optional[str] = Field(
+        None, description="已登记资源版本；与 resource_set 均可省略"
+        "（省略时使用最近登记的资源集）",
+    )
+    resource_set: Optional[ResourceSet] = Field(
+        None, description="随请求携带的资源集（签发时登记，试排不写库）"
+    )
+
+    @field_validator("schedule_time")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return as_utc(v)
+
+    @model_validator(mode="after")
+    def _check(self) -> "ScheduleRequest":
+        if self.resource_set is not None and self.resource_version:
+            if self.resource_set.version != self.resource_version:
+                raise ValueError("resource_set.version 与 resource_version 不一致")
+        if self.package_ids is not None:
+            if len(self.package_ids) != len(set(self.package_ids)):
+                raise ValueError("package_ids 不得重复")
+        return self
+
+
+class ResourceRef(BaseModel):
+    version: str
+    content_hash: str
+    name: str
+    resource_count: int
+
+
+class ScheduleTaskView(BaseModel):
+    sample_id: str
+    item: str
+    phase: Literal["pretreatment", "analysis"]
+    resource_id: str = Field(..., description="承担该任务的工位/仪器")
+    batch_id: str
+    method: Optional[str]
+    start: datetime
+    end: datetime
+    deadline: datetime
+    slack_minutes: int = Field(..., description="余量：截止时刻 - 批次结束（分钟）")
+    on_time: bool
+    frozen: bool = Field(False, description="来自已签发版本的冻结占用，不参与重排")
+    rule: ClockRuleRef = Field(..., description="判定时冻结的规则身份（含规则哈希）")
+
+
+class ScheduleBatchView(BaseModel):
+    batch_id: str
+    resource_id: str
+    kind: ResourceKind
+    method: Optional[str]
+    start: datetime
+    end: datetime
+    capacity: int
+    task_keys: list[str] = Field(
+        default_factory=list, description="批内任务键：sample_id/item/phase"
+    )
+    frozen: bool
+    switch_before_minutes: float = Field(
+        0, description="与前一批次方法不同所需的切换时间（已计入间隔）"
+    )
+
+
+class ConflictInterval(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class AffectedClock(BaseModel):
+    sample_id: str
+    item: str
+    phase: Literal["pretreatment", "analysis"]
+    deadline: datetime
+
+
+class ScheduleConflict(BaseModel):
+    sample_id: str
+    item: str
+    phase: Literal["pretreatment", "analysis"]
+    deadline: datetime
+    reason: Literal["deadline_miss", "no_compatible_resource", "window_unavailable"]
+    resource_id: Optional[str] = Field(None, description="最早可承载该任务的资源")
+    interval: Optional[ConflictInterval] = Field(
+        None, description="该任务最早可占用的区间（结束仍晚于截止）"
+    )
+    minutes_late: Optional[int] = None
+    affected_clocks: list[AffectedClock] = Field(
+        default_factory=list,
+        description="受本冲突波及的时钟（如前处理失败连带分析被阻断）",
+    )
+    message: str
+
+
+class FrozenSource(BaseModel):
+    schedule_id: str
+    version_no: int
+
+
+class ScheduleResult(BaseModel):
+    schedule_id: str
+    version_no: int
+    trial: bool
+    request_id: Optional[str]
+    schedule_time: datetime
+    created_at: datetime
+    resource: ResourceRef
+    content_hash: str = Field(
+        ..., description="排程内容哈希（不含 id/版本/生成时刻）：相同输入得到稳定结果"
+    )
+    status: Literal["feasible", "infeasible"] = Field(
+        ..., description="feasible=全部待排任务均可准时纳入计划；infeasible=存在无解冲突"
+    )
+    frozen_from: Optional[FrozenSource] = Field(
+        None, description="本次试排叠加的已签发占用来源"
+    )
+    summary: dict
+    packages: list[str] = Field(
+        default_factory=list, description="参与排程的判定包 package_id"
+    )
+    tasks: list[ScheduleTaskView]
+    batches: list[ScheduleBatchView]
+    conflicts: list[ScheduleConflict]
+    earliest_conflict: Optional[ScheduleConflict] = Field(
+        None, description="最早冲突（按区间开始时刻排序）"
+    )
+    skipped_clocks: list[dict] = Field(
+        default_factory=list,
+        description="有待办阶段但未形成合规结论、无法排程的时钟",
+    )

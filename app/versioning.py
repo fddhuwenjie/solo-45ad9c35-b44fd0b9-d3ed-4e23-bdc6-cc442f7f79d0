@@ -10,7 +10,7 @@ import json
 from datetime import timezone
 from typing import Any, Iterable
 
-from .models import RuleSet
+from .models import ResourceSet, RuleSet
 
 
 def canonical_json(obj: Any) -> str:
@@ -207,3 +207,116 @@ def diff_judgments(old_pkg: dict, new_pkg: dict) -> list[dict]:
 
 def copy_rule_set(rule_set: RuleSet) -> RuleSet:
     return RuleSet.model_validate(copy.deepcopy(rule_set.model_dump()))
+
+
+# ---------------------------------------------------------------- 资源 ----
+
+def resource_content(resource_set: ResourceSet) -> dict:
+    """决定排程行为的资源内容（note 等不影响排程的字段不参与哈希）。"""
+    def win(w) -> dict:
+        return {"start": _iso(w.start), "end": _iso(w.end)}
+
+    return {
+        "name": resource_set.name,
+        "resources": [
+            {
+                "resource_id": r.resource_id,
+                "kind": r.kind.value,
+                "methods": sorted(r.methods),
+                "capacity": r.capacity,
+                "task_minutes": r.task_minutes,
+                "switch_minutes": r.switch_minutes,
+                "windows": [win(w) for w in sorted(
+                    r.windows, key=lambda x: (x.start, x.end))],
+                "downtime": [win(w) for w in sorted(
+                    r.downtime, key=lambda x: (x.start, x.end))],
+            }
+            for r in sorted(resource_set.resources,
+                            key=lambda x: x.resource_id)
+        ],
+    }
+
+
+def hash_resources(resource_set: ResourceSet) -> str:
+    import hashlib
+
+    payload = canonical_json(resource_content(resource_set)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+# ---------------------------------------------------------------- 排程 ----
+
+def _sched_task_brief(t: dict) -> dict:
+    return {
+        "resource_id": t["resource_id"],
+        "batch_id": t["batch_id"],
+        "start": t["start"],
+        "end": t["end"],
+        "on_time": t["on_time"],
+        "frozen": t.get("frozen", False),
+    }
+
+
+def diff_schedules(old: dict, new: dict) -> list[dict]:
+    """比较两个排程版本（dict），给出任务/冲突/汇总的差异。"""
+    changes: list[dict] = []
+    old_map = {(t["sample_id"], t["item"], t["phase"]): t
+               for t in old.get("tasks", [])}
+    new_map = {(t["sample_id"], t["item"], t["phase"]): t
+               for t in new.get("tasks", [])}
+    for key in sorted(set(old_map) | set(new_map)):
+        sid, item, phase = key
+        if key not in old_map:
+            changes.append({
+                "sample_id": sid, "item": item, "phase": phase,
+                "kind": "task_added", "after": _sched_task_brief(new_map[key]),
+            })
+            continue
+        if key not in new_map:
+            changes.append({
+                "sample_id": sid, "item": item, "phase": phase,
+                "kind": "task_removed", "before": _sched_task_brief(old_map[key]),
+            })
+            continue
+        oc, nc = old_map[key], new_map[key]
+        for f in ("resource_id", "batch_id", "start", "end",
+                  "slack_minutes", "on_time", "frozen"):
+            if oc.get(f) != nc.get(f):
+                changes.append({
+                    "sample_id": sid, "item": item, "phase": phase,
+                    "kind": "field_changed", "field": f,
+                    "before": None if oc.get(f) is None else str(oc.get(f)),
+                    "after": None if nc.get(f) is None else str(nc.get(f)),
+                })
+
+    old_c = {(c["sample_id"], c["item"], c["phase"]): c
+             for c in old.get("conflicts", [])}
+    new_c = {(c["sample_id"], c["item"], c["phase"]): c
+             for c in new.get("conflicts", [])}
+    for key in sorted(set(old_c) | set(new_c)):
+        sid, item, phase = key
+        if key not in old_c:
+            changes.append({
+                "sample_id": sid, "item": item, "phase": phase,
+                "kind": "conflict_added",
+                "after": new_c[key]["message"],
+            })
+        elif key not in new_c:
+            changes.append({
+                "sample_id": sid, "item": item, "phase": phase,
+                "kind": "conflict_cleared",
+                "before": old_c[key]["message"],
+            })
+
+    for f in ("total_tasks", "scheduled", "on_time",
+              "method_switches", "conflicts"):
+        ov = old.get("summary", {}).get(f)
+        nv = new.get("summary", {}).get(f)
+        if ov != nv:
+            changes.append({
+                "sample_id": None, "item": None, "phase": None,
+                "kind": "summary_changed", "field": f,
+                "before": None if ov is None else str(ov),
+                "after": None if nv is None else str(nv),
+            })
+    return changes

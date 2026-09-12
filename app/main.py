@@ -1,4 +1,4 @@
-"""FastAPI 入口：环境检测样品时限判定。"""
+"""FastAPI 入口：环境检测样品时限判定 + 期限驱动的实验排程。"""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -6,14 +6,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import db, schedule_service, service
 from .models import (
     JudgmentRequest,
     JudgmentResult,
+    ResourceSet,
     RuleSet,
+    ScheduleRequest,
+    ScheduleResult,
     SupplementEvent,
 )
-from .versioning import diff_judgments, diff_rule_sets, hash_rules
+from .versioning import diff_judgments, diff_rule_sets, diff_schedules, hash_rules
 
 
 @asynccontextmanager
@@ -29,6 +32,8 @@ app = FastAPI(
     description=(
         "为每个样品—项目建立独立时钟：连续样基准、合样最早组成、分样共享历史、"
         "前处理不清零分析期限；规则内容哈希版本化，旧判定不可改写。"
+        "期限驱动的实验排程：从已冻结判定包读取待办样品—项目，叠加已签发占用，"
+        "按截止时刻判断能否纳入计划；签发冻结占用，补录/新判定只重排草稿。"
     ),
 )
 
@@ -196,3 +201,101 @@ def diff_rules(body: dict) -> dict:
         "change_count": len(changes),
         "changes": changes,
     }
+
+
+# ---------------------------------------------------------------- 资源 ----
+
+@app.post("/api/v1/resources", tags=["resources"], status_code=201)
+def register_resources(resource_set: ResourceSet, dry_run: bool = False) -> dict:
+    """登记资源配置版本（前处理工位/仪器、可用时段、停机窗、方法切换时间、
+    单批容量、任务时长、适用方法）。
+
+    * ``dry_run=true``：只校验并返回内容哈希，不写库；
+    * 同一版本号绑定不同内容 -> 409；完全一致 -> 幂等。
+    """
+    return schedule_service.register_resource_set(resource_set, dry_run=dry_run)
+
+
+@app.get("/api/v1/resources", tags=["resources"])
+def list_resources() -> dict:
+    rows = db.list_resource_sets()
+    return {"count": len(rows), "resources": rows}
+
+
+@app.get("/api/v1/resources/{version}", tags=["resources"])
+def get_resource(version: str):
+    found = db.find_resource_by_version(version)
+    if not found:
+        raise HTTPException(404, f"资源版本不存在: {version}")
+    h, rs = found
+    return {"content_hash": h, "resource_set": rs.model_dump(mode="json")}
+
+
+# ---------------------------------------------------------------- 排程 ----
+
+@app.post("/api/v1/schedules/trial", response_model=ScheduleResult,
+          tags=["scheduling"])
+def schedule_trial(req: ScheduleRequest) -> ScheduleResult:
+    """试排：从已冻结判定包读取待处理样品—项目，叠加已签发占用，不写库。
+
+    响应列出每项任务的工位、批次、起止时刻、余量与规则哈希；无法准时纳入
+    计划的任务进入 conflicts，并指出最早冲突的资源、区间与受影响时钟。
+    相同输入得到稳定结果（content_hash 可校验）。
+    """
+    return schedule_service.run_schedule(req, trial=True)
+
+
+@app.post("/api/v1/schedules", response_model=ScheduleResult,
+          tags=["scheduling"], status_code=201)
+def schedule_issue(req: ScheduleRequest) -> ScheduleResult:
+    """签发：与试排同一计算，结果固化为新版本，其占用对后续排程冻结。
+
+    补录事件或新判定只重排未冻结的草稿部分；同 idempotency_key 幂等。
+    """
+    return schedule_service.run_schedule(req, trial=False)
+
+
+@app.get("/api/v1/schedules", tags=["scheduling"])
+def list_schedules() -> dict:
+    rows = db.list_schedules()
+    return {"count": len(rows), "schedules": rows}
+
+
+@app.get("/api/v1/schedules/{schedule_id}", tags=["scheduling"])
+def get_schedule(schedule_id: str):
+    """取指定签发版本的完整 JSON 排程。"""
+    payload = db.get_schedule(schedule_id)
+    if not payload:
+        raise HTTPException(404, f"排程不存在: {schedule_id}")
+    return JSONResponse(payload)
+
+
+@app.get("/api/v1/schedules/{schedule_id}/diff/{other_schedule_id}",
+         tags=["scheduling"])
+def diff_schedule_versions(schedule_id: str, other_schedule_id: str) -> dict:
+    """比较两个排程版本：任务增删与工位/批次/起止/余量变化、冲突增减。"""
+    a = db.get_schedule(schedule_id)
+    b = db.get_schedule(other_schedule_id)
+    if not a or not b:
+        raise HTTPException(
+            404,
+            f"排程缺失: {schedule_id if not a else other_schedule_id}",
+        )
+    changes = diff_schedules(a, b)
+    return {
+        "from": {"schedule_id": schedule_id, "version_no": a["version_no"],
+                 "content_hash": a["content_hash"], "status": a["status"]},
+        "to": {"schedule_id": other_schedule_id, "version_no": b["version_no"],
+               "content_hash": b["content_hash"], "status": b["status"]},
+        "change_count": len(changes),
+        "changes": changes,
+    }
+
+
+@app.get("/api/v1/schedules/{schedule_id}/workorder", tags=["scheduling"])
+def schedule_workorder(schedule_id: str) -> dict:
+    """JSON 工作单：按资源分组、批次按开始时刻排序的可执行视图。"""
+    payload = db.get_schedule(schedule_id)
+    if not payload:
+        raise HTTPException(404, f"排程不存在: {schedule_id}")
+    return schedule_service.work_order(payload)

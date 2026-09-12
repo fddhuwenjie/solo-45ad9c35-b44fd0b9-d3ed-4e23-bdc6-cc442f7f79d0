@@ -15,8 +15,8 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from .models import JudgmentResult, RuleSet, utc_now
-from .versioning import canonical_json, hash_rules
+from .models import JudgmentResult, ResourceSet, RuleSet, ScheduleResult, utc_now
+from .versioning import canonical_json, hash_resources, hash_rules
 
 DEFAULT_DB = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "app.db"
@@ -80,6 +80,28 @@ def init_db(conn: Optional[sqlite3.Connection] = None) -> None:
             package_id TEXT NOT NULL REFERENCES judgments(package_id),
             PRIMARY KEY (sample_id, version_no)
         );
+        CREATE TABLE IF NOT EXISTS resource_sets (
+            content_hash TEXT PRIMARY KEY,
+            version      TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schedules (
+            schedule_id     TEXT PRIMARY KEY,
+            version_no      INTEGER NOT NULL,
+            trial           INTEGER NOT NULL,
+            request_id      TEXT,
+            idempotency_key TEXT,
+            resource_hash   TEXT NOT NULL REFERENCES resource_sets(content_hash),
+            schedule_time   TEXT NOT NULL,
+            content_hash    TEXT NOT NULL,
+            payload_json    TEXT NOT NULL,
+            request_json    TEXT,
+            created_at      TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_idem
+            ON schedules(idempotency_key) WHERE idempotency_key IS NOT NULL AND trial = 0;
         """
     )
     # 旧库迁移：包内可能冻结多个规则集版本（各时钟唯一匹配），rule_hash 退化为代表
@@ -304,5 +326,188 @@ def next_sample_version(sample_id: str) -> int:
     row = get_conn().execute(
         "SELECT COALESCE(MAX(version_no), 0) AS m FROM sample_versions WHERE sample_id = ?",
         (sample_id,),
+    ).fetchone()
+    return int(row["m"]) + 1
+
+
+def all_sample_ids() -> list[str]:
+    """全部有正式判定记录的样品 id（排程缺省包解析用）。"""
+    rows = get_conn().execute(
+        "SELECT DISTINCT sample_id FROM sample_versions ORDER BY sample_id"
+    ).fetchall()
+    return [r["sample_id"] for r in rows]
+
+
+# ---------------------------------------------------------------- 资源 ----
+
+def register_resource_set(resource_set: ResourceSet) -> tuple[str, bool]:
+    """登记资源集。返回 (content_hash, created)。
+
+    与规则同一套身份策略：版本标签不可被不同内容复用（409）；
+    完全一致（哈希+版本号）-> 幂等返回 created=False。
+    """
+    h = hash_resources(resource_set)
+    conn = get_conn()
+    with _lock:
+        same_hash = conn.execute(
+            "SELECT version FROM resource_sets WHERE content_hash = ?", (h,)
+        ).fetchone()
+        same_label = conn.execute(
+            "SELECT content_hash FROM resource_sets WHERE version = ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (resource_set.version,),
+        ).fetchone()
+        if same_label is not None and same_label["content_hash"] != h:
+            raise HTTPException(
+                409,
+                f"资源版本标签 {resource_set.version} 已绑定内容 "
+                f"{same_label['content_hash'][:12]}，不能以不同内容复用；"
+                "资源变更请使用新版本号，已签发排程不可改写",
+            )
+        if same_hash is not None and same_hash["version"] != resource_set.version:
+            raise HTTPException(
+                409,
+                f"相同资源内容已以版本 {same_hash['version']} 登记，"
+                "不能再绑定不同版本标签",
+            )
+        if same_hash is not None:
+            return h, False
+        conn.execute(
+            "INSERT INTO resource_sets(content_hash, version, name, payload_json,"
+            " created_at) VALUES (?, ?, ?, ?, ?)",
+            (h, resource_set.version, resource_set.name,
+             canonical_json(resource_set.model_dump(mode="json")),
+             utc_now().isoformat()),
+        )
+        conn.commit()
+    return h, True
+
+
+def get_resource_set_by_hash(content_hash: str) -> Optional[dict]:
+    row = get_conn().execute(
+        "SELECT * FROM resource_sets WHERE content_hash = ?", (content_hash,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def find_resource_by_version(version: str) -> Optional[tuple[str, ResourceSet]]:
+    row = get_conn().execute(
+        "SELECT content_hash, payload_json FROM resource_sets WHERE version = ?"
+        " ORDER BY created_at DESC", (version,)
+    ).fetchone()
+    if not row:
+        return None
+    return row["content_hash"], ResourceSet.model_validate(
+        json.loads(row["payload_json"]))
+
+
+def latest_resource_set() -> Optional[tuple[str, ResourceSet]]:
+    row = get_conn().execute(
+        "SELECT content_hash, payload_json FROM resource_sets"
+        " ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return row["content_hash"], ResourceSet.model_validate(
+        json.loads(row["payload_json"]))
+
+
+def list_resource_sets() -> list[dict]:
+    rows = get_conn().execute(
+        "SELECT content_hash, version, name, payload_json, created_at"
+        " FROM resource_sets ORDER BY created_at"
+    ).fetchall()
+    out = []
+    for r in rows:
+        payload = json.loads(r["payload_json"])
+        out.append({
+            "content_hash": r["content_hash"], "version": r["version"],
+            "name": r["name"], "resource_count": len(payload.get("resources", [])),
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+# ---------------------------------------------------------------- 排程 ----
+
+def save_schedule(
+    result: ScheduleResult,
+    *,
+    idempotency_key: Optional[str],
+    request_json: Optional[str] = None,
+) -> ScheduleResult:
+    """签发持久化；同 idempotency_key 重复签发返回原版本（幂等）。"""
+    conn = get_conn()
+    payload = canonical_json(result.model_dump(mode="json"))
+    with _lock:
+        if idempotency_key:
+            row = conn.execute(
+                "SELECT payload_json FROM schedules"
+                " WHERE idempotency_key = ? AND trial = 0",
+                (idempotency_key,),
+            ).fetchone()
+            if row:
+                return ScheduleResult.model_validate(
+                    json.loads(row["payload_json"]))
+        try:
+            conn.execute(
+                "INSERT INTO schedules(schedule_id, version_no, trial, request_id,"
+                " idempotency_key, resource_hash, schedule_time, content_hash,"
+                " payload_json, request_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    result.schedule_id, result.version_no, 0, result.request_id,
+                    idempotency_key, result.resource.content_hash,
+                    result.schedule_time.isoformat(), result.content_hash,
+                    payload, request_json, result.created_at.isoformat(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, f"排程持久化冲突: {exc}") from exc
+        conn.commit()
+    return result
+
+
+def get_schedule(schedule_id: str) -> Optional[dict]:
+    row = get_conn().execute(
+        "SELECT payload_json FROM schedules WHERE schedule_id = ?",
+        (schedule_id,),
+    ).fetchone()
+    return json.loads(row["payload_json"]) if row else None
+
+
+def list_schedules() -> list[dict]:
+    rows = get_conn().execute(
+        "SELECT schedule_id, version_no, resource_hash, schedule_time,"
+        " content_hash, payload_json, created_at"
+        " FROM schedules WHERE trial = 0 ORDER BY version_no"
+    ).fetchall()
+    out = []
+    for r in rows:
+        payload = json.loads(r["payload_json"])
+        out.append({
+            "schedule_id": r["schedule_id"],
+            "version_no": r["version_no"],
+            "resource_hash": r["resource_hash"],
+            "schedule_time": r["schedule_time"],
+            "content_hash": r["content_hash"],
+            "status": payload.get("status"),
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def latest_issued_schedule() -> Optional[dict]:
+    """最近签发的排程版本（其占用对后续试排/签发冻结）。"""
+    row = get_conn().execute(
+        "SELECT payload_json FROM schedules WHERE trial = 0"
+        " ORDER BY version_no DESC LIMIT 1"
+    ).fetchone()
+    return json.loads(row["payload_json"]) if row else None
+
+
+def next_schedule_version() -> int:
+    row = get_conn().execute(
+        "SELECT COALESCE(MAX(version_no), 0) AS m FROM schedules WHERE trial = 0"
     ).fetchone()
     return int(row["m"]) + 1
