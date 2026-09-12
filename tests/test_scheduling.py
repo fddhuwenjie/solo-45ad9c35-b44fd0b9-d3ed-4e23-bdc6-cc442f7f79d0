@@ -540,6 +540,59 @@ def test_global_ontime_beats_greedy_switch100(client):
     assert trial(client, 30).json()["content_hash"] == body["content_hash"]
 
 
+def test_accumulated_exclusion_two_clocks(client):
+    """累计排除：容量 1、任务与切换均 60 分钟、方法 A A B B、截止
+    60/90/120/150。单时钟舍弃只能保 A1（1 个准时）；应累计舍弃 A1、A2，
+    连续安排 B1、B2，准时项目数从 1 提升到 2。"""
+    from app.models import ItemRule, JudgmentRequest, ResourceConfig, ResourceSet, RuleSet
+    rules = RuleSet(version="SR-X", items=[
+        ItemRule(item="a1", pretreatment_minutes=None, analysis_minutes=60),
+        ItemRule(item="a2", pretreatment_minutes=None, analysis_minutes=90),
+        ItemRule(item="b1", pretreatment_minutes=None, analysis_minutes=120),
+        ItemRule(item="b2", pretreatment_minutes=None, analysis_minutes=150),
+    ])
+    samples = [
+        mk_sample("sA1", ["a1"], {"a1": "mA"}),
+        mk_sample("sA2", ["a2"], {"a2": "mA"}),
+        mk_sample("sB1", ["b1"], {"b1": "mB"}),
+        mk_sample("sB2", ["b2"], {"b2": "mB"}),
+    ]
+    req = JudgmentRequest(eval_time=dt(0), rule_set=rules, samples=samples,
+                          idempotency_key="x1")
+    r = client.post("/api/v1/judgments", json=req.model_dump(mode="json"))
+    assert r.status_code == 201, r.text
+    rs = ResourceSet(version="LAB-X", resources=[
+        ResourceConfig(resource_id="IC-1", kind="instrument",
+                       methods=["mA", "mB"], capacity=1, task_minutes=60,
+                       switch_minutes=60, windows=[W(0, 2880)]),
+    ])
+    post_resources(client, rs)
+    body = trial(client, 0).json()
+    assert body["status"] == "infeasible"  # A1、A2 被舍弃
+    tasks = task_map(body)
+    assert ("sA1", "a1", "analysis") not in tasks
+    assert ("sA2", "a2", "analysis") not in tasks
+    # B1、B2 连续安排（容量 1 -> 两个相邻批次，同方法无切换）并准时
+    b1 = tasks[("sB1", "b1", "analysis")]
+    b2 = tasks[("sB2", "b2", "analysis")]
+    assert b1["start"] == izo(0) and b1["end"] == izo(60)
+    assert b2["start"] == izo(60) and b2["end"] == izo(120)
+    assert b1["batch_id"] != b2["batch_id"]
+    assert b1["on_time"] is True and b2["on_time"] is True
+    # 字典序目标：准时时钟数 2（优于贪心的 1），切换数 0
+    assert body["summary"]["on_time_clocks"] == 2
+    assert body["summary"]["total_clocks"] == 4
+    assert body["summary"]["method_switches"] == 0
+    # A1、A2 成为冲突（B 批之后 + 切换 60 -> 最早 [180,240)）
+    cf = {(c["sample_id"], c["item"]): c for c in body["conflicts"]}
+    assert set(cf) == {("sA1", "a1"), ("sA2", "a2")}
+    assert cf[("sA1", "a1")]["interval"] == {"start": izo(180), "end": izo(240)}
+    assert cf[("sA1", "a1")]["minutes_late"] == 180
+    assert cf[("sA2", "a2")]["minutes_late"] == 150
+    # 相同输入重跑结果稳定
+    assert trial(client, 0).json()["content_hash"] == body["content_hash"]
+
+
 def test_removed_resource_keeps_frozen_batches(client):
     """资源版本移除旧 resource_id：已签发批次仍在返回批次、后续计划与
     JSON 工作单中保留（冻结占用不丢）。"""

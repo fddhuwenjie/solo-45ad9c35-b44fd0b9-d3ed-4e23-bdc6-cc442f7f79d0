@@ -26,9 +26,10 @@
 
 1. 先让更多项目准时完成——准时时钟数最大：先做一次确定性 EDF 贪心
    （同等可行时优先并入同方法批次、新建批次取净切换最少且结束最早的
-   位置），若仍有无法准时的时钟，再做“舍弃单个时钟重排”的爬山修复，
-   只要（准时时钟数, 一切换数）字典序更优就接受——例如切换时间很长的
-   反例中，会舍弃一个独占批次的项目，让两个同方法项目合批准时完成；
+   位置）；若仍有无法准时的时钟，再做可累计的舍弃修复——每步把当前
+   已排的某个时钟加入排除集并重排，允许同度量侧移，只要（准时时钟数,
+   −切换数）字典序更优就记录为最优——例如切换时间很长的反例中，会
+   累计舍弃同方法的两个项目，让另两个同方法项目连续成批、准时完成；
 2. 再减少方法切换——爬山比较的第二关键字即全计划切换数；
 3. 相同输入得到稳定结果——所有迭代与 tie-break 确定，无随机性。
 
@@ -46,7 +47,7 @@ from .models import ResourceConfig, ResourceKind
 PRETREATMENT = "pretreatment"
 ANALYSIS = "analysis"
 
-_MAX_REPAIRS = 500  # 爬山修复的安全上限（每次接受都是严格改进，正常远早于此）
+_MAX_REPAIRS = 500  # 舍弃修复的安全上限（排除集单调增长，正常远早于此收敛）
 
 
 @dataclass
@@ -574,17 +575,24 @@ def compute_schedule(
 
     best_metric = metric(states, placed)
     if best_metric[0] < len(all_clocks):
-        # 爬山修复：舍弃单个时钟重排，字典序更优即接受（如长切换时间下
-        # 舍弃独占批次的一个项目，让两个同方法项目合批准时完成）
-        improved = True
+        # 可累计的舍弃修复：每步把当前已排的某个时钟加入排除集并重排，
+        # 排除集单调增长（必然终止），允许同度量侧移以累计多次排除，
+        # 全程记录并返回历史最优。只有“已排”的时钟才可能阻塞他人——
+        # 排除未排时钟是空操作，因此候选只取当前已排时钟。
+        excluded: set[tuple[str, str]] = set()
+        cur_states, cur_placed = states, placed
+        cur_metric = best_metric
+        best_states, best_placed = states, placed
         guard = 0
-        while improved and guard < _MAX_REPAIRS:
-            improved = False
+        while guard < _MAX_REPAIRS:
             guard += 1
-            for ck in all_clocks:
-                reduced = [
-                    t for t in tasks if (t.sample_id, t.item) != ck
-                ]
+            placed_clocks = sorted({(t.sample_id, t.item)
+                                    for t, _ in cur_placed})
+            top = None  # (metric, ck, states, placed)；升序扫描，并列取先者
+            for ck in placed_clocks:
+                drop = excluded | {ck}
+                reduced = [t for t in tasks
+                           if (t.sample_id, t.item) not in drop]
                 states2, placed2 = _greedy_place(
                     tasks=reduced,
                     resources=resources,
@@ -593,10 +601,17 @@ def compute_schedule(
                     schedule_time=schedule_time,
                 )
                 m2 = metric(states2, placed2)
-                if m2 > best_metric:
-                    states, placed, best_metric = states2, placed2, m2
-                    improved = True
-                    break
+                if top is None or m2 > top[0]:
+                    top = (m2, ck, states2, placed2)
+            if top is None or top[0] < cur_metric:
+                break  # 继续排除只会变差：收敛
+            _m, ck, cur_states, cur_placed = top
+            excluded.add(ck)
+            cur_metric = _m
+            if _m > best_metric:
+                best_metric = _m
+                best_states, best_placed = cur_states, cur_placed
+        states, placed = best_states, best_placed
 
     stations = sorted(
         (s for s in states.values() if s.cfg.kind == ResourceKind.PRETREATMENT),
