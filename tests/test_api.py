@@ -874,6 +874,113 @@ def test_registration_conflict_precheck(client):
     assert ok.status_code == 201
 
 
+def test_equivalent_overlap_diff_rule_id_rejected(client):
+    """回归：生效区间/基质/方法/容器/保存条件/限值全同、仅 rule_id 不同的两条
+    规则会形成两个独立候选（引擎去重键含 rule_id），登记预检必须拦截。"""
+    from app.models import JudgmentRequest
+    r1 = _scoped_rule("cod-x", matrices=["surface_water"], methods=["hj828"],
+                      containers=["glass"], storage=["refrigerated_4c"],
+                      analysis=1440, pre=120)
+    r2 = _scoped_rule("cod-y", matrices=["surface_water"], methods=["hj828"],
+                      containers=["glass"], storage=["refrigerated_4c"],
+                      analysis=1440, pre=120)
+    first = _RS(version="eq1", items=[r1])
+    ra = client.post("/api/v1/rules", json=first.model_dump(mode="json"))
+    assert ra.status_code == 201
+
+    second = _RS(version="eq2", items=[r2])
+    # 干跑预检即报告冲突
+    dr = client.post("/api/v1/rules?dry_run=true",
+                     json=second.model_dump(mode="json")).json()
+    assert dr["would_register"] is False
+    assert dr["conflict_count"] >= 1
+    conf = dr["conflicts"][0]
+    assert conf["item"] == "cod"
+    assert conf["new_rule_id"] == "cod-y"
+    assert conf["existing_rule_id"] == "cod-x"
+    # 四个适用维度均完全重叠（intersection 非空）
+    assert conf["overlap"]["matrix"]["intersection"] == ["surface_water"]
+    assert conf["overlap"]["method"]["intersection"] == ["hj828"]
+    # 正式登记 409，库中只有第一套
+    rc = client.post("/api/v1/rules", json=second.model_dump(mode="json"))
+    assert rc.status_code == 409
+    versions = [r["version"] for r in
+                client.get("/api/v1/rules").json()["rules"]]
+    assert versions == ["eq1"]
+
+    # 既有候选匹配/试算不受影响：只有 cod-x 在库 -> 唯一匹配
+    s = _scoped_sample(matrix="surface_water", method="hj828",
+                       container="glass", storage="refrigerated_4c")
+    req = JudgmentRequest(eval_time=dt(30), samples=[s])
+    tr = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = tr.json()["clocks"][0]
+    assert cl["match_status"] == "unique"
+    assert cl["matched_rule"]["rule_id"] == "cod-x"
+    assert cl["conclusive"] is True
+    # 正式接收可冻结唯一规则
+    req = JudgmentRequest(eval_time=dt(30), samples=[s],
+                          idempotency_key="eq-ik")
+    fr = client.post("/api/v1/judgments", json=req.model_dump(mode="json"))
+    assert fr.status_code == 201, fr.text
+    assert fr.json()["clocks"][0]["matched_rule"]["rule_id"] == "cod-x"
+
+    # 影响预览：被拦截的第二套即使并入候选池做只读试算，也不登记、不改旧判定
+    ip = client.post("/api/v1/rules/impact-preview",
+                     json=second.model_dump(mode="json")).json()
+    assert ip["candidate_version"] == "eq2"
+    hit = [x for x in ip["reselected"] if x["sample_id"] == "b1"
+           and x["item"] == "cod"]
+    assert hit and hit[0]["after_match_status"] == "ambiguous"
+    versions_after = [r["version"] for r in
+                      client.get("/api/v1/rules").json()["rules"]]
+    assert "eq2" not in versions_after
+    pkg_id = fr.json()["package_id"]
+    old = client.get(f"/api/v1/judgments/{pkg_id}").json()
+    assert old["clocks"][0]["matched_rule"]["rule_id"] == "cod-x"
+
+
+def test_equivalent_overlap_same_rule_id_cross_set_rejected(client):
+    """跨规则集即使 rule_id 相同，规则集哈希不同仍是独立候选 -> 同样拦截。"""
+    r1 = _scoped_rule("cod-z", matrices=["surface_water"], analysis=1440)
+    r2 = _scoped_rule("cod-z", matrices=["surface_water"], analysis=900)
+    assert client.post("/api/v1/rules",
+                       json=_RS(version="s1", items=[r1]).model_dump(mode="json")
+                       ).status_code == 201
+    rc = client.post("/api/v1/rules",
+                     json=_RS(version="s2", items=[r2]).model_dump(mode="json"))
+    assert rc.status_code == 409
+
+
+def test_trial_adhoc_equivalent_rule_yields_ambiguous(client):
+    """试算携带的未登记等价规则与在库规则并存 -> ambiguous（预检无法约束试算
+    携带集，但匹配行为必须保持：不形成结论，正式接收拒绝）。"""
+    from app.models import JudgmentRequest
+    r1 = _scoped_rule("cod-x", matrices=["surface_water"], methods=["hj828"],
+                      containers=["glass"], storage=["refrigerated_4c"],
+                      analysis=1440)
+    assert client.post("/api/v1/rules",
+                       json=_RS(version="t1", items=[r1]).model_dump(mode="json")
+                       ).status_code == 201
+    r2 = _scoped_rule("cod-y", matrices=["surface_water"], methods=["hj828"],
+                      containers=["glass"], storage=["refrigerated_4c"],
+                      analysis=1440)
+    s = _scoped_sample(matrix="surface_water", method="hj828",
+                       container="glass", storage="refrigerated_4c")
+    req = JudgmentRequest(eval_time=dt(30), rule_set=_RS(version="t2", items=[r2]),
+                          samples=[s])
+    tr = client.post("/api/v1/judgments/trial", json=req.model_dump(mode="json"))
+    cl = tr.json()["clocks"][0]
+    assert cl["match_status"] == "ambiguous"
+    assert cl["status"] == "indeterminate"
+    assert cl["conclusive"] is False
+    assert len([c for c in cl["candidates"] if c["applies"]]) == 2
+    # 正式接收被守门拒绝
+    assert client.post("/api/v1/judgments",
+                       json=req.model_dump(mode="json")).status_code == 422
+    # 试算未登记第二套
+    assert [r["version"] for r in client.get("/api/v1/rules").json()["rules"]] == ["t1"]
+
+
 def test_trial_forced_candidate_comparison(client):
     surf = _RS(version="r1", items=[
         _scoped_rule("cod-surface", matrices=["surface_water"], analysis=1000)])

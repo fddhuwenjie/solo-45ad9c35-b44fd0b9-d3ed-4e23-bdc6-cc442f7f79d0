@@ -86,41 +86,19 @@ def evaluate_applicability(rule: Any, ctx: dict) -> list[dict]:
     return unmet
 
 
-def _same_limits(r1: Any, r2: Any) -> bool:
-    return (
-        r1.min_temp_c == r2.min_temp_c
-        and r1.max_temp_c == r2.max_temp_c
-        and r1.pretreatment_minutes == r2.pretreatment_minutes
-        and r1.analysis_minutes == r2.analysis_minutes
-        and sorted(r1.required_preservation) == sorted(r2.required_preservation)
-        and r1.continuous_basis == r2.continuous_basis
-    )
-
-
-def _same_scope(r1: Any, r2: Any) -> bool:
-    return (
-        r1.effective_from == r2.effective_from
-        and r1.effective_to == r2.effective_to
-        and sorted(r1.matrices) == sorted(r2.matrices)
-        and sorted(r1.methods) == sorted(r2.methods)
-        and sorted(r1.containers) == sorted(r2.containers)
-        and sorted(r1.storage_conditions) == sorted(r2.storage_conditions)
-    )
-
-
-def same_rule_item(r1: Any, r2: Any) -> bool:
-    """两条项目规则的判定内容与适用范围完全相同（重复发布）。"""
-    return _same_limits(r1, r2) and _same_scope(r1, r2)
-
-
 def scope_conflict(r1: Any, r2: Any) -> Optional[dict]:
     """同一项目的两条规则是否存在适用范围冲突。
 
     冲突 = 生效区间重叠，且四个适用维度的取值集合都可能同时命中
-    （通配与任何具体值重叠）。内容完全相同的重复发布不算冲突。
+    （通配与任何具体值重叠）。只要适用范围可能同时命中，两条规则就会在候选
+    池中形成独立候选（候选去重键含规则集哈希与 rule_id），因此：
+
+    * 仅 rule_id 不同但范围/限值完全相同 -> 仍算冲突（会产生两个同等候选）；
+    * 跨规则集 rule_id 相同但范围重叠 -> 同样冲突（分属不同规则集哈希）；
+    * 整套规则集逐字节重复发布由登记层按内容哈希幂等去重，不到此函数。
     返回冲突维度说明；不冲突返回 None。
     """
-    if r1.item != r2.item or same_rule_item(r1, r2):
+    if r1.item != r2.item:
         return None
     if not intervals_overlap(
         r1.effective_from, r1.effective_to, r2.effective_from, r2.effective_to
